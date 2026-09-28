@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     import numpy as np
 except ImportError:
-    sys.exit("numpy is not installed.\n  pip install numpy")
+    sys.exit("numpy is not installed.\n  python -m pip install numpy")
 
 MODEL_NAME = "claude-haiku-4-5"
 EMBED_MODEL = "voyage-2"
@@ -57,7 +57,7 @@ def require(module, package=None):
         return __import__(module)
     except ImportError:
         sys.exit(f"{module} is not installed.\n"
-                 f"  pip install {package or module}")
+                 f"  python -m pip install {package or module}")
 
 
 def need(var, where):

@@ -41,8 +41,12 @@ That is the entire idea. Its effect is the gap between the first two rows.
 ## Running it
 
 ```bash
-pip install voyageai anthropic numpy
+python -m pip install voyageai anthropic numpy
 ```
+
+Through `python -m` rather than `pip` directly: it installs into the same
+interpreter that will run the script, which matters when more than one Python
+is on the machine, and it works when `pip` is not on PATH.
 
 Stage 1 needs one key. Stage 2 needs two.
 
