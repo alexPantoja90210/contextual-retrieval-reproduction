@@ -1,0 +1,6 @@
+# Cached vector databases: rebuilt by running a stage, and large
+data/*_vector_db.pkl
+
+__pycache__/
+*.pyc
+.venv/
