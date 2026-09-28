@@ -51,12 +51,29 @@ is on the machine, and it works when `pip` is not on PATH.
 Stage 1 needs one key. Stage 2 needs two.
 
 ```bash
-# Stage 1 — baseline.  ~$0.05, a few minutes.  VOYAGE_API_KEY only.
+# Stage 1 — baseline.  VOYAGE_API_KEY only.
 python reproduce.py baseline
 
-# Stage 2 — contextual.  ~$1-3, 15-30 minutes.  Adds ANTHROPIC_API_KEY.
+# Stage 2 — contextual.  Adds ANTHROPIC_API_KEY.
 python reproduce.py contextual
 ```
+
+### On Voyage's free tier
+
+Without a payment method on file, Voyage allows **3 requests and 10,000 tokens
+per minute**. The corpus is about 127,000 estimated tokens, so stage 1 takes
+around **13 minutes** and costs nothing. The script respects both limits and
+tells you what it is waiting for.
+
+Two things make that possible. Requests are batched by token count rather than
+by a fixed number of chunks, so no single request exceeds the per-minute budget
+— 737 chunks go out as 16 requests. And all 246 unique queries are embedded in
+one batch up front rather than one at a time, which on this tier is the
+difference between one request and over an hour of waiting.
+
+With a payment method the limits rise sharply and the free token allowance still
+applies, so it still costs nothing — pass `--rpm=300 --tpm=1000000` to run it in
+about a minute.
 
 Keys come from [voyageai.com](https://www.voyageai.com/) and
 [console.anthropic.com](https://console.anthropic.com/).

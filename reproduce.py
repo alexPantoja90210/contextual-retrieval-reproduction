@@ -36,6 +36,67 @@ MODEL_NAME = "claude-haiku-4-5"
 EMBED_MODEL = "voyage-2"
 K_VALUES = [5, 10, 20]
 
+# Voyage's free tier, before a payment method is added, allows 3 requests and
+# 10,000 tokens per minute. Both are respected below. Adding a payment method
+# raises these a lot and the free token allowance still applies, so pass
+# --rpm/--tpm to go faster if you have done that.
+FREE_RPM, FREE_TPM = 3, 10_000
+# A single request must fit inside the per-minute token budget with room to
+# spare, or it can never be sent.
+MAX_TOKENS_PER_REQUEST = 8_000
+
+
+def est_tokens(text):
+    """Rough and deliberately generous: characters over four."""
+    return max(1, len(text) // 4)
+
+
+class RateLimiter:
+    """Respects a requests-per-minute and a tokens-per-minute budget at once.
+
+    The token budget is what actually binds here: the corpus is about 124,000
+    estimated tokens, so on the free tier the floor is roughly 13 minutes no
+    matter how the requests are arranged.
+    """
+
+    def __init__(self, rpm, tpm):
+        self.rpm, self.tpm = rpm, tpm
+        self.events = []          # (timestamp, tokens)
+
+    def _prune(self, now):
+        self.events = [e for e in self.events if now - e[0] < 60.0]
+
+    def wait_for(self, tokens):
+        while True:
+            now = time.time()
+            self._prune(now)
+            used_req = len(self.events)
+            used_tok = sum(t for _, t in self.events)
+            if used_req < self.rpm and used_tok + tokens <= self.tpm:
+                self.events.append((now, tokens))
+                return
+            oldest = min(e[0] for e in self.events)
+            sleep = max(0.5, 60.0 - (now - oldest) + 0.25)
+            print(f"  rate limit: waiting {sleep:.0f}s "
+                  f"({used_req}/{self.rpm} req, {used_tok}/{self.tpm} tok in the last minute)",
+                  end="\r")
+            time.sleep(sleep)
+
+
+def batch_by_tokens(texts, cap=MAX_TOKENS_PER_REQUEST):
+    """Group texts so no request exceeds the per-request token cap."""
+    batches, cur, cur_tokens = [], [], 0
+    for t in texts:
+        n = est_tokens(t)
+        if cur and cur_tokens + n > cap:
+            batches.append(cur)
+            cur, cur_tokens = [], 0
+        cur.append(t)
+        cur_tokens += n
+    if cur:
+        batches.append(cur)
+    return batches
+
 # What the guide reports. The whole point of this script is the comparison.
 PUBLISHED = {
     "baseline":   {5: 80.92, 10: 87.15, 20: 90.06},
@@ -80,11 +141,58 @@ class VectorDB:
 
     name = "baseline"
 
-    def __init__(self):
+    def __init__(self, rpm=FREE_RPM, tpm=FREE_TPM):
         voyageai = require("voyageai")
         self.client = voyageai.Client(api_key=need("VOYAGE_API_KEY", "voyageai.com"))
         self.embeddings, self.metadata, self.query_cache = [], [], {}
+        self.limiter = RateLimiter(rpm, tpm)
         self.db_path = os.path.join(HERE, "data", f"{self.name}_vector_db.pkl")
+
+    def embed_batch(self, texts):
+        """One request, throttled, retried on a rate-limit answer."""
+        tokens = sum(est_tokens(t) for t in texts)
+        for attempt in range(6):
+            self.limiter.wait_for(tokens)
+            try:
+                return self.client.embed(texts, model=EMBED_MODEL).embeddings
+            except Exception as exc:
+                if "rate limit" not in str(exc).lower() or attempt == 5:
+                    raise
+                back = 20 * (attempt + 1)
+                print(f"  rate limited by the server, backing off {back}s     ")
+                time.sleep(back)
+        raise RuntimeError("unreachable")
+
+    def embed_all(self, texts, label):
+        batches = batch_by_tokens(texts)
+        total_tokens = sum(est_tokens(t) for t in texts)
+        minutes = total_tokens / max(1, self.limiter.tpm)
+        print(f"  {label}: {len(texts)} texts, ~{total_tokens:,} tokens, "
+              f"{len(batches)} requests")
+        print(f"  at {self.limiter.tpm:,} tokens/min this takes about "
+              f"{minutes:.0f} min")
+        out, done = [], 0
+        for b in batches:
+            out.extend(self.embed_batch(b))
+            done += len(b)
+            print(f"  {label}: {done}/{len(texts)}                              ", end="\r")
+        print(f"  {label}: {len(texts)}/{len(texts)} done                       ")
+        return out
+
+    def embed_queries(self, queries):
+        """All query embeddings up front, in batches.
+
+        Embedding them one at a time is 248 requests. On the free tier that is
+        over an hour of waiting for 3,600 tokens of text.
+        """
+        unique = sorted({q["query"] for q in queries})
+        missing = [q for q in unique if q not in self.query_cache]
+        if not missing:
+            return
+        vecs = self.embed_all(missing, "queries")
+        for q, v in zip(missing, vecs):
+            self.query_cache[q] = v
+        self.save()
 
     def texts_and_metadata(self, dataset):
         texts, meta = [], []
@@ -101,26 +209,27 @@ class VectorDB:
             with open(self.db_path, "rb") as f:
                 d = pickle.load(f)
             self.embeddings, self.metadata = d["embeddings"], d["metadata"]
-            print(f"  loaded {len(self.embeddings)} embeddings from cache")
+            self.query_cache = d.get("query_cache", {})
+            print(f"  loaded {len(self.embeddings)} embeddings and "
+                  f"{len(self.query_cache)} query vectors from cache")
             return
         texts, meta = self.texts_and_metadata(dataset)
         self.embed_and_store(texts, meta)
 
     def embed_and_store(self, texts, meta):
-        out, batch = [], 128
-        for i in range(0, len(texts), batch):
-            out.extend(self.client.embed(texts[i:i + batch], model=EMBED_MODEL).embeddings)
-            print(f"  embedded {min(i + batch, len(texts))}/{len(texts)}", end="\r")
-        print()
-        self.embeddings, self.metadata = out, meta
-        with open(self.db_path, "wb") as f:
-            pickle.dump({"embeddings": out, "metadata": meta}, f)
+        self.embeddings = self.embed_all(texts, "chunks")
+        self.metadata = meta
+        self.save()
         print(f"  cached to {os.path.basename(self.db_path)}")
+
+    def save(self):
+        with open(self.db_path, "wb") as f:
+            pickle.dump({"embeddings": self.embeddings, "metadata": self.metadata,
+                         "query_cache": self.query_cache}, f)
 
     def search(self, query, k=20):
         if query not in self.query_cache:
-            self.query_cache[query] = self.client.embed(
-                [query], model=EMBED_MODEL).embeddings[0]
+            self.query_cache[query] = self.embed_batch([query])[0]
         sims = np.dot(self.embeddings, self.query_cache[query])
         return [{"metadata": self.metadata[i]} for i in np.argsort(sims)[::-1][:k]]
 
@@ -149,8 +258,8 @@ class ContextualVectorDB(VectorDB):
 
     name = "contextual"
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, rpm=FREE_RPM, tpm=FREE_TPM):
+        super().__init__(rpm=rpm, tpm=tpm)
         anthropic = require("anthropic")
         self.anthropic = anthropic.Anthropic(
             api_key=need("ANTHROPIC_API_KEY", "console.anthropic.com"))
@@ -269,18 +378,31 @@ def report(stage, mine):
 
 
 def main():
-    stage = sys.argv[1] if len(sys.argv) > 1 else "baseline"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a.split("=")[0]: a.split("=")[1]
+             for a in sys.argv[1:] if a.startswith("--") and "=" in a}
+    stage = args[0] if args else "baseline"
     if stage not in PUBLISHED:
-        sys.exit(f"stage must be one of: {', '.join(PUBLISHED)}")
+        sys.exit(f"stage must be one of: {', '.join(PUBLISHED)}\n"
+                 f"  python reproduce.py baseline [--rpm=3] [--tpm=10000]")
+    rpm = int(flags.get("--rpm", FREE_RPM))
+    tpm = int(flags.get("--tpm", FREE_TPM))
 
     dataset = json.load(open(CHUNKS, encoding="utf-8"))
     queries = load_jsonl(QUERIES)
     chunks = sum(len(d["chunks"]) for d in dataset)
-    print(f"\n{chunks} chunks from {len(dataset)} documents, {len(queries)} queries\n")
+    print(f"\n{chunks} chunks from {len(dataset)} documents, {len(queries)} queries")
+    if (rpm, tpm) == (FREE_RPM, FREE_TPM):
+        print("Voyage free tier: 3 requests and 10,000 tokens per minute.")
+        print("With a payment method on file the limits rise and the free token")
+        print("allowance still applies — then pass --rpm=300 --tpm=1000000.\n")
+    else:
+        print(f"Rate limits: {rpm} requests/min, {tpm:,} tokens/min\n")
 
     started = time.time()
-    db = VectorDB() if stage == "baseline" else ContextualVectorDB()
+    db = (VectorDB if stage == "baseline" else ContextualVectorDB)(rpm=rpm, tpm=tpm)
     db.load_data(dataset)
+    db.embed_queries(queries)
 
     mine = {}
     for k in K_VALUES:
