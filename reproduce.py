@@ -15,6 +15,20 @@ nothing and re-scores in seconds.
 
   python reproduce.py baseline
   python reproduce.py contextual [--rpm=3] [--tpm=10000]
+
+The embedder can be swapped. With --embedder=titan the same chunks, the same
+queries and the same scoring run against Amazon Titan Text Embeddings V2 on
+Bedrock instead of voyage-2. Nothing else changes, which is the point: the
+gain contextual retrieval produces was published for one embedding model, and
+whether it survives another is an open question.
+
+  python reproduce.py baseline   --embedder=titan
+  python reproduce.py contextual --embedder=titan
+
+The second reuses the contextualized chunks the voyage-2 run already wrote to
+disk, so Claude does not situate them a second time and no Anthropic key is
+needed. The text is byte-identical across the two runs; only the embedder
+differs.
 """
 import json
 import os
@@ -24,20 +38,18 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from embedders import DIMENSIONS, make_embedder
+
 try:
     import numpy as np
 except ImportError:
     sys.exit("numpy is not installed.\n  python -m pip install numpy")
 
 MODEL_NAME = "claude-haiku-4-5"
-EMBED_MODEL = "voyage-2"
 K_VALUES = [5, 10, 20]
 
-# Voyage's free tier, before a payment method is added, allows 3 requests and
-# 10,000 tokens per minute. Both are respected. A payment method raises these
-# a lot and the free token allowance still applies, so pass --rpm/--tpm then.
-FREE_RPM, FREE_TPM = 3, 10_000
-# A request is sized well under the per-minute budget, and the minute is not
+# Each provider states its own per-minute limits in embedders.py; --rpm and
+# --tpm override them. A request is sized well under the per-minute budget, and the minute is not
 # filled to the brim. Token counts are never exact, and something sized at the
 # limit has nowhere to be wrong.
 REQUEST_FRACTION = 0.55
@@ -50,6 +62,11 @@ HAIKU_CACHE_WRITE, HAIKU_CACHE_READ = 1.25, 0.10
 # a run that goes wrong stops early instead of spending an account's balance.
 DEFAULT_BUDGET = 1.50
 
+# The guide's own figures, for voyage-2. They are the published anchor: the
+# baseline reproduced here landed on all three to the hundredth, which is what
+# makes this harness a calibrated instrument. A run on a different embedder is
+# not measured against these — it is measured against the voyage-2 run that
+# matched them.
 PUBLISHED = {
     "baseline":   {5: 80.92, 10: 87.15, 20: 90.06},
     "contextual": {5: 88.12, 10: 92.34, 20: 94.29},
@@ -87,35 +104,11 @@ def load_jsonl(path):
         return [json.loads(line) for line in f]
 
 
-# ------------------------------------------------------------------- tokens
-# The real tokenizer when it loads, a pessimistic estimate otherwise. An earlier
-# version divided characters by four, which is about right for prose and badly
-# wrong for source code: it undercounted this corpus by 60%, and the very first
-# request went out over the per-minute budget.
-_TOKENIZER, _TRIED = None, False
-
-
-def _tokenizer():
-    global _TOKENIZER, _TRIED
-    if not _TRIED:
-        _TRIED = True
-        try:
-            from tokenizers import Tokenizer
-            _TOKENIZER = Tokenizer.from_pretrained("voyageai/voyage-2")
-            print("  counting tokens with the voyage-2 tokenizer")
-        except Exception:
-            print("  voyage-2 tokenizer unavailable; estimating at 2.5 chars/token")
-    return _TOKENIZER
-
-
-def est_tokens(text):
-    t = _tokenizer()
-    if t is not None:
-        try:
-            return max(1, len(t.encode(text).ids))
-        except Exception:
-            pass
-    return max(1, int(len(text) / 2.5))
+# Token counting moved to embedders.py, which owns it per provider: the real
+# voyage-2 tokenizer where it loads, a pessimistic estimate otherwise. An
+# earlier version divided characters by four, which is about right for prose
+# and badly wrong for source code: it undercounted this corpus by 60%, and the
+# very first request went out over the per-minute budget.
 
 
 class RateLimiter:
@@ -157,19 +150,23 @@ class VectorDB:
 
     name = "baseline"
 
-    def __init__(self, rpm=FREE_RPM, tpm=FREE_TPM):
-        voyageai = require("voyageai")
-        self.client = voyageai.Client(api_key=need("VOYAGE_API_KEY", "voyageai.com"))
+    def __init__(self, embedder, rpm=None, tpm=None):
+        self.embedder = embedder
+        rpm = rpm or embedder.default_rpm
+        tpm = tpm or embedder.default_tpm
         self.embeddings, self.metadata, self.query_cache = [], [], {}
         self.limiter = RateLimiter(rpm, int(tpm * BUDGET_FRACTION))
         self.request_cap = max(400, int(tpm * REQUEST_FRACTION))
         self._tok = {}
-        self.db_path = os.path.join(HERE, "data", f"{self.name}_vector_db.pkl")
+        # The voyage-2 caches keep their original names, so an existing run is
+        # not invalidated by this file gaining a second provider.
+        self.db_path = os.path.join(
+            HERE, "data", f"{self.name}{embedder.suffix}_vector_db.pkl")
 
     # -- token accounting ----------------------------------------------------
     def tokens(self, text):
         if text not in self._tok:
-            self._tok[text] = est_tokens(text)
+            self._tok[text] = self.embedder.count(text)
         return self._tok[text]
 
     # -- embedding -----------------------------------------------------------
@@ -186,11 +183,16 @@ class VectorDB:
               f"{total / max(1, self.limiter.tpm):.0f} min")
 
         out, i, refused, stuck = [], 0, 0, 0
+        # Some providers take one text per call. The loop below still thinks in
+        # batches; the provider fans them out and reassembles them in order.
+        cap_texts = self.embedder.max_texts
         while i < len(texts):
             batch, used, j = [], 0, i
             while j < len(texts):
                 n = self.tokens(texts[j])
                 if batch and used + n > self.request_cap:
+                    break
+                if cap_texts and len(batch) >= cap_texts:
                     break
                 batch.append(texts[j])
                 used += n
@@ -198,7 +200,7 @@ class VectorDB:
 
             self.limiter.wait_for(used)
             try:
-                out.extend(self.client.embed(batch, model=EMBED_MODEL).embeddings)
+                out.extend(self.embedder.embed(batch))
             except Exception as exc:
                 if "rate limit" not in str(exc).lower():
                     raise
@@ -311,17 +313,28 @@ class ContextualVectorDB(VectorDB):
 
     name = "contextual"
 
-    def __init__(self, rpm=FREE_RPM, tpm=FREE_TPM, budget=DEFAULT_BUDGET):
-        super().__init__(rpm=rpm, tpm=tpm)
+    def __init__(self, embedder, rpm=None, tpm=None, budget=DEFAULT_BUDGET):
+        super().__init__(embedder, rpm=rpm, tpm=tpm)
         self.budget = budget
-        anthropic = require("anthropic")
-        self.anthropic = anthropic.Anthropic(
-            api_key=need("ANTHROPIC_API_KEY", "console.anthropic.com"))
-        self.db_path = os.path.join(HERE, "data", f"{self.name}_vector_db.pkl")
+        self.anthropic = None
+        self._temp_kwargs = None
         self.usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
         self.lock = threading.Lock()
         self.temperature_ok = True
-        self._temp_kwargs = self._temperature_kwargs()
+
+    def claude(self):
+        """Built on first use, not in the constructor.
+
+        Re-embedding chunks that Claude already situated needs no Anthropic
+        key. Demanding one for a run that will never call the API is how a key
+        ends up set in a shell that did not need it.
+        """
+        if self.anthropic is None:
+            anthropic = require("anthropic")
+            self.anthropic = anthropic.Anthropic(
+                api_key=need("ANTHROPIC_API_KEY", "console.anthropic.com"))
+            self._temp_kwargs = self._temperature_kwargs()
+        return self.anthropic
 
     def _temperature_kwargs(self):
         """Pass temperature in whichever way this SDK version accepts.
@@ -343,6 +356,7 @@ class ContextualVectorDB(VectorDB):
         return {"extra_body": {"temperature": 0.0}}
 
     def situate(self, doc, chunk):
+        client = self.claude()
         body = dict(
             model=MODEL_NAME, max_tokens=1000,
             messages=[{"role": "user", "content": [
@@ -356,7 +370,7 @@ class ContextualVectorDB(VectorDB):
         if self.temperature_ok:
             body.update(self._temp_kwargs)
         try:
-            r = self.anthropic.messages.create(**body)
+            r = client.messages.create(**body)
         except Exception as exc:
             if self.temperature_ok and "temperature" in str(exc).lower():
                 with self.lock:
@@ -364,7 +378,7 @@ class ContextualVectorDB(VectorDB):
                         self.temperature_ok = False
                         print("  this model does not take temperature; continuing "
                               "at the default                    ")
-                r = self.anthropic.messages.create(
+                r = client.messages.create(
                     **{k: v for k, v in body.items()
                        if k not in ("temperature", "extra_body")})
             else:
@@ -387,6 +401,23 @@ class ContextualVectorDB(VectorDB):
     def load_data(self, dataset, threads=4):
         if os.path.exists(self.db_path):
             return VectorDB.load_data(self, dataset)
+
+        # A second embedder does not re-run the situating pass. The
+        # contextualized text is already on disk from the voyage-2 run, and
+        # reusing it byte for byte is what makes the comparison a comparison:
+        # regenerating it would change two things at once.
+        donor = os.path.join(HERE, "data", "contextual_vector_db.pkl")
+        if self.embedder.suffix and os.path.exists(donor):
+            with open(donor, "rb") as f:
+                self.metadata = pickle.load(f)["metadata"]
+            print(f"  reusing {len(self.metadata)} contextualized chunks written by")
+            print("  the voyage-2 run; Claude is not called again. The text is")
+            print("  identical, so the embedder is the only difference between them.")
+            self.embeddings = self.embed_all(
+                [m["content"] for m in self.metadata], "chunks")
+            self.save()
+            print(f"  cached to {os.path.basename(self.db_path)}")
+            return
 
         total = sum(len(d["chunks"]) for d in dataset)
         print(f"  situating {total} chunks with {MODEL_NAME}, document by document")
@@ -480,7 +511,17 @@ def evaluate(db, queries, k):
     return 100 * total / len(queries)
 
 
-def report(stage, mine):
+def load_reference(stage):
+    """The voyage-2 result for this stage, if it has been run."""
+    path = os.path.join(HERE, f"result_{stage}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return {int(k): v for k, v in json.load(f)["mine"].items()}
+
+
+def report_published(stage, mine):
+    """voyage-2 against the guide. A reproduction either matched or it did not."""
     pub, tol = PUBLISHED[stage], TOLERANCE[stage]
     print(f"\n{'=' * 62}")
     print(f"  {stage.upper()}  —  yours against the published guide")
@@ -504,6 +545,37 @@ def report(stage, mine):
     return ok
 
 
+def report_swap(stage, mine, embedder, ref):
+    """A different embedder against the voyage-2 run on this machine.
+
+    There is no published figure for this, so there is nothing to pass or
+    fail. What the run produces is a measurement and a difference, and the
+    difference is the point: the corpus, the queries and the scoring are held
+    fixed, so the columns differ by the embedding model and nothing else.
+    """
+    print(f"\n{'=' * 62}")
+    print(f"  {stage.upper()}  —  {embedder.label} against your voyage-2 run")
+    print(f"{'=' * 62}")
+    if ref is None:
+        print(f"  No result_{stage}.json on disk, so there is nothing to place")
+        print(f"  these next to yet. Run the voyage-2 {stage} stage first.")
+        print(f"{'-' * 62}")
+        for k in K_VALUES:
+            print(f"  Pass@{k:<5}{mine[k]:>9.2f}%")
+        print(f"{'=' * 62}\n")
+        return True
+    print(f"  {'':9}{'voyage-2':>12}{embedder.label:>16}{'diff':>9}")
+    for k in K_VALUES:
+        d = mine[k] - ref[k]
+        print(f"  Pass@{k:<5}{ref[k]:>11.2f}%{mine[k]:>15.2f}%{d:>+8.2f}")
+    print(f"{'-' * 62}")
+    print(f"  Same {DIMENSIONS} dimensions, same chunks, same queries, same scoring.")
+    print("  The embedding model is the only difference between these columns.")
+    print("  Run both stages on both embedders, then: python consolidate.py")
+    print(f"{'=' * 62}\n")
+    return True
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = dict(a[2:].split("=", 1) for a in sys.argv[1:]
@@ -511,15 +583,18 @@ def main():
     stage = args[0] if args else "baseline"
     if stage not in PUBLISHED:
         sys.exit(f"stage must be one of: {', '.join(PUBLISHED)}\n"
-                 f"  python reproduce.py baseline [--rpm=3] [--tpm=10000]")
-    rpm, tpm = int(flags.get("rpm", FREE_RPM)), int(flags.get("tpm", FREE_TPM))
+                 f"  python reproduce.py baseline [--embedder=voyage|titan]")
+    embedder = make_embedder(flags.get("embedder", "voyage"))
+    rpm = int(flags["rpm"]) if "rpm" in flags else embedder.default_rpm
+    tpm = int(flags["tpm"]) if "tpm" in flags else embedder.default_tpm
     budget = float(flags.get("budget", DEFAULT_BUDGET))
 
     dataset = json.load(open(CHUNKS, encoding="utf-8"))
     queries = load_jsonl(QUERIES)
     chunks = sum(len(d["chunks"]) for d in dataset)
     print(f"\n{chunks} chunks from {len(dataset)} documents, {len(queries)} queries")
-    if (rpm, tpm) == (FREE_RPM, FREE_TPM):
+    print(f"embedder: {embedder.label} at {DIMENSIONS} dimensions")
+    if embedder.key == "voyage" and (rpm, tpm) == (3, 10_000):
         print("Voyage free tier: 3 requests and 10,000 tokens per minute.")
         print("A payment method raises these and the free token allowance still")
         print("applies — then pass --rpm=300 --tpm=1000000.\n")
@@ -527,8 +602,8 @@ def main():
         print(f"Rate limits: {rpm} requests/min, {tpm:,} tokens/min\n")
 
     started = time.time()
-    db = (VectorDB(rpm=rpm, tpm=tpm) if stage == "baseline"
-          else ContextualVectorDB(rpm=rpm, tpm=tpm, budget=budget))
+    db = (VectorDB(embedder, rpm=rpm, tpm=tpm) if stage == "baseline"
+          else ContextualVectorDB(embedder, rpm=rpm, tpm=tpm, budget=budget))
     db.load_data(dataset)
     db.embed_queries(queries)
 
@@ -537,16 +612,26 @@ def main():
         mine[k] = evaluate(db, queries, k)
         print(f"  Pass@{k}: {mine[k]:.2f}%")
 
-    matched = report(stage, mine)
+    ref = load_reference(stage) if embedder.suffix else None
+    if embedder.key == "voyage":
+        ok = report_published(stage, mine)
+    else:
+        ok = report_swap(stage, mine, embedder, ref)
+    note = embedder.report()
+    if note:
+        print(note)
     print(f"  elapsed: {time.time() - started:.0f}s")
-    with open(os.path.join(HERE, f"result_{stage}.json"), "w", encoding="utf-8") as f:
-        json.dump({"stage": stage, "mine": mine, "published": PUBLISHED[stage],
-                   "matched": matched, "chunks": chunks, "queries": len(queries),
-                   "embed_model": EMBED_MODEL,
+    name = f"result_{stage}{embedder.suffix}.json"
+    with open(os.path.join(HERE, name), "w", encoding="utf-8") as f:
+        json.dump({"stage": stage, "embedder": embedder.key, "mine": mine,
+                   "published": PUBLISHED[stage] if embedder.key == "voyage" else None,
+                   "reference": ref,
+                   "matched": ok, "chunks": chunks, "queries": len(queries),
+                   "embed_model": embedder.label, "dimensions": DIMENSIONS,
                    "model": MODEL_NAME if stage == "contextual" else None},
                   f, indent=2)
-    print(f"  written: result_{stage}.json")
-    return 0 if matched else 1
+    print(f"  written: {name}")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

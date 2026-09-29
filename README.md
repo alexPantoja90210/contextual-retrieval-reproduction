@@ -125,6 +125,57 @@ Stages 3 and 4 of the guide — hybrid BM25 and reranking — need Elasticsearch
 Docker and a Cohere key. They are not run here. The first two stages are where
 the idea being tested lives; the last two are retrieval engineering on top of it.
 
+## Does the gain survive a different embedding model?
+
+Anthropic published this technique measured on one embedder, voyage-2. Whether
+the gain belongs to the technique or to that particular model is a separate
+question, and it is not one the guide answers.
+
+The harness can answer it, because the baseline above reproduced the published
+figures. An instrument that reads true on a known answer can be pointed at an
+unknown one. So the embedding provider is swappable, and a second provider is
+included: **Amazon Titan Text Embeddings V2**, through Bedrock.
+
+```bash
+python reproduce.py baseline   --embedder=titan
+python reproduce.py contextual --embedder=titan
+python consolidate.py
+```
+
+Everything except the embedder is held fixed — the same 737 chunks, the same
+248 queries, the same golden chunks, the same dot-product-over-top-k scoring,
+and the same 1024 dimensions. The contextual stage reuses the contextualized
+text the voyage-2 run already wrote to disk rather than regenerating it, so
+Claude is not called a second time and the text being embedded is byte-identical
+across the two runs. Changing one thing is the only way the difference means
+anything.
+
+These runs are **not** a reproduction and the script does not grade them. There
+is no published Titan figure for this benchmark, so there is nothing to match.
+What they produce is a measurement placed next to another measurement:
+
+| Embedder | @5 | @10 | @20 |
+|---|---|---|---|
+| Anthropic, published | +7.20 | +5.19 | +4.23 |
+| voyage-2, this repo | +6.53 | +4.95 | +4.93 |
+| titan-embed-v2 | — | — | — |
+
+`consolidate.py` fills the last row and writes `RESULTS.md`.
+
+Setup is in [BEDROCK-SETUP.md](BEDROCK-SETUP.md): model access, a scoped IAM
+user limited to one action on one model in one region, and the CLI profile.
+Titan Embed v2 is $0.02 per million input tokens, so both stages together cost
+a few cents. Nothing is left running — there is no vector store, no index and
+no infrastructure to delete.
+
+```bash
+python test_embedders.py    # no AWS, no credentials, no network
+```
+
+That test covers the failures that would not look like failures: a batch
+reassembled in the wrong order still scores, and a silently dropped retry
+produces a short run that reports Pass@k as if it were complete.
+
 ## What the number means, and what it does not
 
 Pass@20 asks one question with an unambiguous answer: **is the correct chunk in
@@ -179,8 +230,8 @@ Neither changes what is measured.
 
 ## License and attribution
 
-This repository's own code — `reproduce.py`, `test_batching.py` — is MIT
-licensed. The data files and `guide.ipynb` come from
+This repository's own code — `reproduce.py`, `embedders.py`, `consolidate.py`,
+`test_batching.py`, `test_embedders.py` — is MIT licensed. The data files and `guide.ipynb` come from
 [anthropics/claude-cookbooks](https://github.com/anthropics/claude-cookbooks),
 also MIT licensed, copyright Anthropic, and are included unchanged so the
 benchmark runs from a clone. The published figures being matched are theirs.

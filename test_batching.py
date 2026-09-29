@@ -28,25 +28,39 @@ def load_module():
     return m
 
 
-class RefusingClient:
-    """Accepts a request only when it is under the limit, like the real one."""
+class RefusingEmbedder:
+    """An embedder whose real limit is below what the caller believes.
 
-    def __init__(self, limit_tokens, est):
-        self.limit, self.est = limit_tokens, est
+    It implements the same interface as the providers in embedders.py, so the
+    batching loop cannot tell it apart from a real one.
+    """
+
+    key, label, suffix = "stub", "stub", "_stub"
+    max_texts = None
+    default_rpm, default_tpm = 10_000, 10_000_000
+
+    def __init__(self, limit_tokens):
+        self.limit = limit_tokens
         self.calls, self.refusals, self.max_accepted = 0, 0, 0
 
-    def embed(self, texts, model=None):
+    def count(self, text):
+        # Deliberately an estimate rather than a real tokenizer. What is under
+        # test is that the run converges however wrong the count is, so the
+        # count being wrong is the condition, not a flaw in the test.
+        return max(1, int(len(text) / 2.5))
+
+    def embed(self, texts):
         self.calls += 1
-        tokens = sum(self.est(t) for t in texts)
+        tokens = sum(self.count(t) for t in texts)
         if tokens > self.limit:
             self.refusals += 1
             raise RuntimeError(
                 "rate limit exceeded: you have not yet added your payment method")
         self.max_accepted = max(self.max_accepted, tokens)
+        return [[0.0] * 4 for _ in texts]
 
-        class R:
-            embeddings = [[0.0] * 4 for _ in texts]
-        return R()
+    def report(self):
+        return None
 
 
 def main():
@@ -66,12 +80,9 @@ def main():
     # splitting. That case must fail with a clear message, not spin forever.
     impossible = 1_500
     for true_limit in (10_000, 6_000, 3_000, impossible):
-        db = m.VectorDB.__new__(m.VectorDB)
-        db.limiter = m.RateLimiter(rpm=10_000, tpm=10_000_000)   # timing out of the way
-        db.request_cap = 5_500                                    # what it believes
-        db.client = RefusingClient(true_limit, m.est_tokens)
-        db.query_cache = {}
-        db._tok = {}
+        emb = RefusingEmbedder(true_limit)
+        db = m.VectorDB(emb, rpm=10_000, tpm=10_000_000)  # timing out of the way
+        db.request_cap = 5_500                            # what it believes
 
         try:
             out = db.embed_all(texts, "chunks")
@@ -92,7 +103,7 @@ def main():
             failures += 1
             continue
 
-        c = db.client
+        c = emb
         status = "ok" if ok else "WRONG COUNT"
         print(f"  server limit {true_limit:>6}: {len(out)} vectors  "
               f"{c.calls} calls, {c.refusals} refused, "
