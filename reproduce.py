@@ -308,10 +308,31 @@ class ContextualVectorDB(VectorDB):
         self.db_path = os.path.join(HERE, "data", f"{self.name}_vector_db.pkl")
         self.usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
         self.lock = threading.Lock()
+        self.temperature_ok = True
+        self._temp_kwargs = self._temperature_kwargs()
+
+    def _temperature_kwargs(self):
+        """Pass temperature in whichever way this SDK version accepts.
+
+        The published guide calls messages.create(temperature=0.0). SDK 1.9
+        dropped temperature from that signature, so the guide as written raises
+        TypeError on a current install. The API still takes the field, so it
+        goes through extra_body instead — and if the server refuses it too, the
+        run continues without it and says so, because a default temperature is
+        a small loss of determinism, not a reason to stop.
+        """
+        import inspect
+        try:
+            params = inspect.signature(type(self.anthropic.messages).create).parameters
+            if "temperature" in params:
+                return {"temperature": 0.0}
+        except (TypeError, ValueError):
+            pass
+        return {"extra_body": {"temperature": 0.0}}
 
     def situate(self, doc, chunk):
-        r = self.anthropic.messages.create(
-            model=MODEL_NAME, max_tokens=1000, temperature=0.0,
+        body = dict(
+            model=MODEL_NAME, max_tokens=1000,
             messages=[{"role": "user", "content": [
                 {"type": "text",
                  "text": DOCUMENT_CONTEXT_PROMPT.format(doc_content=doc),
@@ -320,6 +341,22 @@ class ContextualVectorDB(VectorDB):
                  "text": CHUNK_CONTEXT_PROMPT.format(chunk_content=chunk)},
             ]}],
         )
+        if self.temperature_ok:
+            body.update(self._temp_kwargs)
+        try:
+            r = self.anthropic.messages.create(**body)
+        except Exception as exc:
+            if self.temperature_ok and "temperature" in str(exc).lower():
+                with self.lock:
+                    if self.temperature_ok:
+                        self.temperature_ok = False
+                        print("  this model does not take temperature; continuing "
+                              "at the default                    ")
+                r = self.anthropic.messages.create(
+                    **{k: v for k, v in body.items()
+                       if k not in ("temperature", "extra_body")})
+            else:
+                raise
         return r.content[0].text, r.usage
 
     def load_data(self, dataset, threads=4):

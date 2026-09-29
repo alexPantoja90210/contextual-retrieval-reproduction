@@ -116,6 +116,21 @@ forties.
 Both kinds of number are honest. They answer different questions. Quoting one
 while implying the other is where RAG reporting usually goes wrong.
 
+## Where the published guide no longer runs as written
+
+Two things in the cookbook have aged, and both are handled here:
+
+- **`temperature` on `messages.create()`.** The guide passes it as a named
+  argument. Anthropic's SDK 1.9 dropped it from that signature, so the guide as
+  published raises `TypeError` on a current install. The API still accepts the
+  field, so it is sent through `extra_body`; if the server refuses it too, the
+  run continues at the default temperature and says so, because that is a small
+  loss of determinism rather than a reason to stop.
+- **The prompt-caching beta header.** Prompt caching is generally available, so
+  the `anthropic-beta` header the guide sets is no longer needed.
+
+Neither changes what is measured.
+
 ## Source
 
 The data, the retrieval code and the published figures are Anthropic's:
