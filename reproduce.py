@@ -43,6 +43,13 @@ FREE_RPM, FREE_TPM = 3, 10_000
 REQUEST_FRACTION = 0.55
 BUDGET_FRACTION = 0.85
 
+# Claude Haiku 4.5, dollars per million tokens.
+HAIKU_IN, HAIKU_OUT = 1.00, 5.00
+HAIKU_CACHE_WRITE, HAIKU_CACHE_READ = 1.25, 0.10
+# Stage 2 should cost well under a dollar on this corpus. The guard is here so
+# a run that goes wrong stops early instead of spending an account's balance.
+DEFAULT_BUDGET = 1.50
+
 PUBLISHED = {
     "baseline":   {5: 80.92, 10: 87.15, 20: 90.06},
     "contextual": {5: 88.12, 10: 92.34, 20: 94.29},
@@ -300,8 +307,9 @@ class ContextualVectorDB(VectorDB):
 
     name = "contextual"
 
-    def __init__(self, rpm=FREE_RPM, tpm=FREE_TPM):
+    def __init__(self, rpm=FREE_RPM, tpm=FREE_TPM, budget=DEFAULT_BUDGET):
         super().__init__(rpm=rpm, tpm=tpm)
+        self.budget = budget
         anthropic = require("anthropic")
         self.anthropic = anthropic.Anthropic(
             api_key=need("ANTHROPIC_API_KEY", "console.anthropic.com"))
@@ -359,40 +367,78 @@ class ContextualVectorDB(VectorDB):
                 raise
         return r.content[0].text, r.usage
 
+    def spend(self):
+        """Dollars so far, from the usage the API actually reported."""
+        u = self.usage
+        return (u["input"] * HAIKU_IN + u["output"] * HAIKU_OUT
+                + u["cache_write"] * HAIKU_CACHE_WRITE
+                + u["cache_read"] * HAIKU_CACHE_READ) / 1_000_000
+
+    def record(self, usage):
+        self.usage["input"] += usage.input_tokens
+        self.usage["output"] += usage.output_tokens
+        self.usage["cache_read"] += getattr(usage, "cache_read_input_tokens", 0) or 0
+        self.usage["cache_write"] += getattr(usage, "cache_creation_input_tokens", 0) or 0
+
     def load_data(self, dataset, threads=4):
         if os.path.exists(self.db_path):
             return VectorDB.load_data(self, dataset)
 
-        jobs = [(doc, ch) for doc in dataset for ch in doc["chunks"]]
-        print(f"  situating {len(jobs)} chunks with {MODEL_NAME} ({threads} threads)")
-        done = [0]
+        total = sum(len(d["chunks"]) for d in dataset)
+        print(f"  situating {total} chunks with {MODEL_NAME}, document by document")
+        print(f"  budget: ${self.budget:.2f} — the run stops if it is exceeded")
+        done, results = [0], []
 
-        def work(doc, chunk):
-            text, usage = self.situate(doc["content"], chunk["content"])
-            with self.lock:
-                self.usage["input"] += usage.input_tokens
-                self.usage["output"] += usage.output_tokens
-                self.usage["cache_read"] += getattr(usage, "cache_read_input_tokens", 0) or 0
-                self.usage["cache_write"] += getattr(usage, "cache_creation_input_tokens", 0) or 0
-                done[0] += 1
-                print(f"  situating: {done[0]}/{len(jobs)}    ", end="\r")
+        def entry(doc, chunk, text):
             return {"doc_id": doc["doc_id"], "chunk_id": chunk["chunk_id"],
                     "original_index": chunk["original_index"],
                     "original_content": chunk["content"],
                     "content": f"{chunk['content']}\n\n{text}"}
 
-        results = []
-        with ThreadPoolExecutor(max_workers=threads) as ex:
-            for f in as_completed([ex.submit(work, d, c) for d, c in jobs]):
-                results.append(f.result())
-        print(f"  situating: {len(jobs)}/{len(jobs)} done          ")
+        def work(doc, chunk):
+            text, usage = self.situate(doc["content"], chunk["content"])
+            with self.lock:
+                self.record(usage)
+                done[0] += 1
+                print(f"  situating: {done[0]}/{total}   ${self.spend():.2f} spent"
+                      f"          ", end="\r")
+            return entry(doc, chunk, text)
+
+        for doc in dataset:
+            chunks = doc["chunks"]
+            if not chunks:
+                continue
+            # The first chunk of a document goes alone, so the document is
+            # written to the cache once. Sending several at once races: each
+            # request can arrive before the entry exists and pay the write
+            # price, which is 12x the read price and would roughly double the
+            # bill for this stage.
+            results.append(work(doc, chunks[0]))
+            if len(chunks) > 1:
+                with ThreadPoolExecutor(max_workers=threads) as ex:
+                    for f in as_completed([ex.submit(work, doc, c) for c in chunks[1:]]):
+                        results.append(f.result())
+
+            if self.spend() > self.budget:
+                sys.exit(f"\n\n  Stopped at ${self.spend():.2f}, over the ${self.budget:.2f} "
+                         f"budget, with {done[0]} of {total} chunks done.\n"
+                         f"  Nothing was cached, so nothing is half-written. Raise it with\n"
+                         f"  --budget=2.00 if that is the cost you expect.")
+
+        print(f"  situating: {total}/{total} done                              ")
         u = self.usage
         print(f"  tokens: {u['input']:,} in, {u['output']:,} out, "
-              f"{u['cache_read']:,} from cache, {u['cache_write']:,} written to cache")
+              f"{u['cache_read']:,} read from cache, {u['cache_write']:,} written")
         if u["cache_read"] + u["cache_write"]:
             share = u["cache_read"] / (u["cache_read"] + u["cache_write"])
-            print(f"  {share:.0%} of document tokens were served from cache "
-                  f"rather than re-billed")
+            print(f"  {share:.0%} of document tokens came from cache rather than "
+                  f"being re-billed")
+            if share < 0.5:
+                print("  That share is low. Without caching the document is billed once")
+                print("  per chunk at full input price, which is what makes this stage")
+                print("  expensive. The figures below are still valid; the bill is not")
+                print("  what it should be.")
+        print(f"  cost of this stage: ${self.spend():.2f}")
 
         self.embeddings = self.embed_all([r["content"] for r in results], "chunks")
         self.metadata = results
@@ -463,6 +509,7 @@ def main():
         sys.exit(f"stage must be one of: {', '.join(PUBLISHED)}\n"
                  f"  python reproduce.py baseline [--rpm=3] [--tpm=10000]")
     rpm, tpm = int(flags.get("rpm", FREE_RPM)), int(flags.get("tpm", FREE_TPM))
+    budget = float(flags.get("budget", DEFAULT_BUDGET))
 
     dataset = json.load(open(CHUNKS, encoding="utf-8"))
     queries = load_jsonl(QUERIES)
@@ -476,7 +523,8 @@ def main():
         print(f"Rate limits: {rpm} requests/min, {tpm:,} tokens/min\n")
 
     started = time.time()
-    db = (VectorDB if stage == "baseline" else ContextualVectorDB)(rpm=rpm, tpm=tpm)
+    db = (VectorDB(rpm=rpm, tpm=tpm) if stage == "baseline"
+          else ContextualVectorDB(rpm=rpm, tpm=tpm, budget=budget))
     db.load_data(dataset)
     db.embed_queries(queries)
 
