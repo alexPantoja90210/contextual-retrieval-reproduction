@@ -1,0 +1,18 @@
+{
+  "stage": "contextual",
+  "mine": {
+    "5": 87.44719662058372,
+    "10": 92.10349462365592,
+    "20": 94.99327956989248
+  },
+  "published": {
+    "5": 88.12,
+    "10": 92.34,
+    "20": 94.29
+  },
+  "matched": true,
+  "chunks": 737,
+  "queries": 248,
+  "embed_model": "voyage-2",
+  "model": "claude-haiku-4-5"
+}

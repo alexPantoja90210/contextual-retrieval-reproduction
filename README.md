@@ -20,6 +20,29 @@ the top k retrieved?
 | + Hybrid BM25 | 86.43% | 93.21% | 94.99% |
 | + Reranking | 92.15% | 95.26% | 97.45% |
 
+## Results
+
+Both stages run here reproduced the published figures.
+
+| Stage | | Pass@5 | Pass@10 | Pass@20 |
+|---|---|---|---|---|
+| Baseline | published | 80.92% | 87.15% | 90.06% |
+| Baseline | **this run** | **80.92%** | **87.15%** | **90.06%** |
+| Contextual | published | 88.12% | 92.34% | 94.29% |
+| Contextual | **this run** | **87.45%** | **92.10%** | **94.99%** |
+| | gain measured here | +6.53 | +4.95 | +4.93 |
+
+The baseline matched to the hundredth — 80.91878, 87.14958, 90.06336. Embeddings
+are deterministic, so an unchanged method on unchanged data has one answer, and
+landing on it is what makes the rest of the table worth reading.
+
+The contextual stage scatters about half a point in both directions, inside a
+tolerance of two. That stage puts a language model in the pipeline and the line
+it writes for a chunk is not guaranteed to be identical twice, so a match to the
+hundredth here would be the suspicious result rather than the good one.
+
+Raw figures are in `result_baseline.json` and `result_contextual.json`.
+
 The retrieval and scoring code here is the guide's own, unchanged: voyage-2
 embeddings, dot-product similarity, top-k, and the same scoring function. What
 this repository adds is the comparison and the verdict.
