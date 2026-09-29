@@ -1,0 +1,17 @@
+# Line endings are normalized here so the repository holds one convention and
+# an edit made on one platform never lands as a diff on another. Without this,
+# a file written on Linux and committed from Windows can show up as a
+# whole-file change that alters nothing but the bytes at the end of each line.
+#
+# text=auto lets Git decide what is text; eol=lf keeps LF in the working copy
+# on every platform, including Windows. Modern Windows editors and tooling
+# handle LF, and matching the repository avoids a class of diff that is noise.
+* text=auto eol=lf
+
+# Vector databases and any binary output: never inspected or rewritten.
+*.pkl binary
+
+# guide.ipynb is redistributed from anthropics/claude-cookbooks unchanged, and
+# the README says so. Normalization would rewrite its bytes and quietly make
+# that claim false, so it is excluded from the text rules entirely.
+*.ipynb -text
