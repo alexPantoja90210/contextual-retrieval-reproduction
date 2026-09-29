@@ -295,7 +295,10 @@ class LocalEmbedder(Embedder):
         self.limit = int(getattr(self.st, "max_seq_length", 0) or 0)
         print(f"  maximum sequence length in effect: {self.limit or 'unknown'} tokens")
 
-        dim = self.st.get_sentence_embedding_dimension()
+        # sentence-transformers renamed this; support both rather than warn.
+        get_dim = (getattr(self.st, "get_embedding_dimension", None)
+                   or self.st.get_sentence_embedding_dimension)
+        dim = get_dim()
         if dim != DIMENSIONS:
             sys.exit(f"\n  {self.model} returns {dim} dimensions, not {DIMENSIONS}.\n"
                      f"  The comparison holds width fixed, so a different width\n"

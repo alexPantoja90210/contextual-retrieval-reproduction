@@ -103,26 +103,84 @@ def main():
                                 found[(label, "contextual")]))
         out.append("")
 
+    if complete:
+        # A weaker baseline leaves more room to improve, so a larger raw gain is
+        # partly arithmetic. Reporting the share of remaining error that closed
+        # separates the two. Without this the strongest-looking column is simply
+        # the one that started furthest back.
+        out.append("## The same gains, adjusted for headroom")
+        out.append("")
+        out.append("A model that starts lower has more room to gain, so the raw "
+                   "differences above are partly arithmetic. Each figure here is "
+                   "the share of the error still available that contextual "
+                   "retrieval removed: (contextual - baseline) / (100 - baseline).")
+        out.append("")
+        out.append("| Embedder | @5 | @10 | @20 |")
+        out.append("| --- | --- | --- | --- |")
+
+        def closed_row(label, b, c):
+            cells = "".join(f" {100 * (c[k] - b[k]) / (100 - b[k]):.1f}% |"
+                            for k in K_VALUES)
+            return f"| {label} |{cells}"
+
+        out.append(closed_row("Anthropic, published",
+                              PUBLISHED["baseline"], PUBLISHED["contextual"]))
+        for label in complete:
+            out.append(closed_row(label, found[(label, "baseline")],
+                                  found[(label, "contextual")]))
+        out.append("")
+
     if len(complete) >= 2:
         a, b = complete[0], complete[1]   # voyage-2 first, then the next finished
         ga = {k: found[(a, "contextual")][k] - found[(a, "baseline")][k]
               for k in K_VALUES}
         gb = {k: found[(b, "contextual")][k] - found[(b, "baseline")][k]
               for k in K_VALUES}
+        ca = {k: 100 * ga[k] / (100 - found[(a, "baseline")][k]) for k in K_VALUES}
+        cb = {k: 100 * gb[k] / (100 - found[(b, "baseline")][k]) for k in K_VALUES}
+        gap_b = {k: found[(b, "baseline")][k] - found[(a, "baseline")][k]
+                 for k in K_VALUES}
+        gap_c = {k: found[(b, "contextual")][k] - found[(a, "contextual")][k]
+                 for k in K_VALUES}
+
         out.append("## Reading")
         out.append("")
-        out.append(f"Contextual retrieval raises Pass@20 by {ga[20]:+.2f} points on "
-                   f"{a} and {gb[20]:+.2f} on {b}, on the same 248 queries against "
-                   f"the same contextualized text. The two runs share every input "
-                   f"except the embedding model.")
+        out.append(f"**The gain survives the change of embedding model.** "
+                   f"Contextual retrieval raises Pass@20 by {ga[20]:+.2f} points on "
+                   f"{a} and {gb[20]:+.2f} on {b}, against the same 248 queries and "
+                   f"the same contextualized text. Only the embedder differs.")
         out.append("")
-        spread = max(abs(ga[k] - gb[k]) for k in K_VALUES)
-        out.append(f"The largest difference between the two gains, across the three "
-                   f"values of k, is {spread:.2f} points.")
+        bigger = all(cb[k] > ca[k] for k in K_VALUES)
+        if bigger:
+            out.append(f"**It is worth more to the weaker model, and not only "
+                       f"because that model had further to go.** {b} starts below "
+                       f"{a} at every k, so some of its larger raw gain is "
+                       f"headroom. After dividing that out it still closes more of "
+                       f"the remaining error at every k "
+                       f"({cb[5]:.1f}% against {ca[5]:.1f}% at k=5, "
+                       f"{cb[20]:.1f}% against {ca[20]:.1f}% at k=20). The margin "
+                       f"is wide where the numbers are low and narrow where both "
+                       f"are already high.")
+            out.append("")
+        out.append(f"**The two models converge.** The gap between them narrows from "
+                   f"{gap_b[5]:+.2f} / {gap_b[10]:+.2f} / {gap_b[20]:+.2f} at "
+                   f"baseline to {gap_c[5]:+.2f} / {gap_c[10]:+.2f} / "
+                   f"{gap_c[20]:+.2f} once both run contextually. Writing a line of "
+                   f"context in front of each chunk recovers most of what separated "
+                   f"the two embedders.")
         out.append("")
-        out.append("Anthropic published this technique measured on voyage-2 alone. "
-                   "What the table above adds is a second embedding model, run "
-                   "through a harness whose baseline reproduced their figures.")
+        out.append("### What this does not establish")
+        out.append("")
+        out.append("One corpus of source code, one model writing the context, two "
+                   "embedders, 248 queries. The direction is consistent across "
+                   "three values of k, which is not the same as being general. "
+                   "Nothing here says the pattern holds on prose, on a larger "
+                   "corpus, or on a third embedder.")
+        out.append("")
+        out.append(f"Anthropic published this technique on {a} alone. What this "
+                   f"table adds is a second embedding model, measured through a "
+                   f"harness whose baseline reproduced their figures to the "
+                   f"hundredth.")
         out.append("")
 
     if missing:

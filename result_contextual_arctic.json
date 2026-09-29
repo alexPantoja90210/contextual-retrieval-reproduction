@@ -1,0 +1,21 @@
+{
+  "stage": "contextual",
+  "embedder": "arctic",
+  "mine": {
+    "5": 86.10311059907833,
+    "10": 91.0954301075269,
+    "20": 94.6236559139785
+  },
+  "published": null,
+  "reference": {
+    "5": 87.44719662058372,
+    "10": 92.10349462365592,
+    "20": 94.99327956989248
+  },
+  "matched": true,
+  "chunks": 737,
+  "queries": 248,
+  "embed_model": "arctic-embed-l-v2",
+  "dimensions": 1024,
+  "model": "claude-haiku-4-5"
+}

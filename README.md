@@ -156,16 +156,44 @@ across the two runs. Changing one thing is the only way the difference means
 anything.
 
 These runs are **not** a reproduction and the script does not grade them. There
-is no published Titan figure for this benchmark, so there is nothing to match.
-What they produce is a measurement placed next to another measurement:
+is no published figure for another embedder on this benchmark, so there is
+nothing to match. What they produce is a measurement placed next to another
+measurement.
+
+### The answer, so far
+
+| Embedder | Pass@5 | Pass@10 | Pass@20 | | @5 | @10 | @20 |
+|---|---|---|---|---|---|---|---|
+| voyage-2, baseline | 80.92% | 87.15% | 90.06% | gain | | | |
+| voyage-2, contextual | 87.45% | 92.10% | 94.99% | | +6.53 | +4.95 | +4.93 |
+| arctic-embed-l-v2, baseline | 76.78% | 82.74% | 88.79% | | | | |
+| arctic-embed-l-v2, contextual | 86.10% | 91.10% | 94.62% | | **+9.33** | **+8.36** | **+5.84** |
+
+**The gain survives the change of embedding model**, and it is larger on the
+weaker one. Arctic starts 4.14 points below voyage-2 at Pass@5 and gains 2.80
+points more from contextual retrieval.
+
+Some of that is headroom: a model that starts lower has more room to move.
+Dividing it out — each gain as a share of the error still available to remove —
+the effect holds:
 
 | Embedder | @5 | @10 | @20 |
 |---|---|---|---|
-| Anthropic, published | +7.20 | +5.19 | +4.23 |
-| voyage-2, this repo | +6.53 | +4.95 | +4.93 |
-| titan-embed-v2 | — | — | — |
+| Anthropic, published | 37.7% | 40.4% | 42.6% |
+| voyage-2 | 34.2% | 38.6% | 49.6% |
+| arctic-embed-l-v2 | **40.2%** | **48.4%** | **52.1%** |
 
-`consolidate.py` fills the remaining rows and writes `RESULTS.md`.
+**And the two models converge.** The gap between them narrows from
+−4.14 / −4.41 / −1.28 at baseline to −1.34 / −1.01 / −0.37 once both run
+contextually. A single line of context in front of each chunk recovers most of
+what separated the two embedders.
+
+One corpus of source code, one model writing the context, two embedders, 248
+queries. The direction is consistent across three values of k, which is not the
+same as being general.
+
+`consolidate.py` regenerates all of this into [RESULTS.md](RESULTS.md) and fills
+the Titan rows when that run happens.
 
 ### Why the context window decides which model can answer this
 
