@@ -7,17 +7,14 @@ the guide's own, unchanged: voyage-2 embeddings, dot-product similarity, top-k,
 and the same scoring function. What this script adds is the comparison — your
 numbers printed next to the published ones, with a verdict.
 
-Run it in stages. Each stage caches its vector database to disk, so a second run
-costs nothing and re-scores in seconds.
+Run it in stages. Each caches its vector database to disk, so a second run costs
+nothing and re-scores in seconds.
 
-  stage 1  baseline      VOYAGE_API_KEY only        ~$0.05, a few minutes
-  stage 2  contextual    + ANTHROPIC_API_KEY        ~$1-3, 15-30 minutes
-
-Stages 3 and 4 in the guide (hybrid BM25, reranking) need Elasticsearch in
-Docker and a Cohere key; they are not run here.
+  stage 1  baseline      VOYAGE_API_KEY only
+  stage 2  contextual    + ANTHROPIC_API_KEY
 
   python reproduce.py baseline
-  python reproduce.py contextual
+  python reproduce.py contextual [--rpm=3] [--tpm=10000]
 """
 import json
 import os
@@ -37,83 +34,31 @@ EMBED_MODEL = "voyage-2"
 K_VALUES = [5, 10, 20]
 
 # Voyage's free tier, before a payment method is added, allows 3 requests and
-# 10,000 tokens per minute. Both are respected below. Adding a payment method
-# raises these a lot and the free token allowance still applies, so pass
-# --rpm/--tpm to go faster if you have done that.
+# 10,000 tokens per minute. Both are respected. A payment method raises these
+# a lot and the free token allowance still applies, so pass --rpm/--tpm then.
 FREE_RPM, FREE_TPM = 3, 10_000
-# A single request must fit inside the per-minute token budget with room to
-# spare, or it can never be sent.
-MAX_TOKENS_PER_REQUEST = 8_000
+# A request is sized well under the per-minute budget, and the minute is not
+# filled to the brim. Token counts are never exact, and something sized at the
+# limit has nowhere to be wrong.
+REQUEST_FRACTION = 0.55
+BUDGET_FRACTION = 0.85
 
-
-def est_tokens(text):
-    """Rough and deliberately generous: characters over four."""
-    return max(1, len(text) // 4)
-
-
-class RateLimiter:
-    """Respects a requests-per-minute and a tokens-per-minute budget at once.
-
-    The token budget is what actually binds here: the corpus is about 124,000
-    estimated tokens, so on the free tier the floor is roughly 13 minutes no
-    matter how the requests are arranged.
-    """
-
-    def __init__(self, rpm, tpm):
-        self.rpm, self.tpm = rpm, tpm
-        self.events = []          # (timestamp, tokens)
-
-    def _prune(self, now):
-        self.events = [e for e in self.events if now - e[0] < 60.0]
-
-    def wait_for(self, tokens):
-        while True:
-            now = time.time()
-            self._prune(now)
-            used_req = len(self.events)
-            used_tok = sum(t for _, t in self.events)
-            if used_req < self.rpm and used_tok + tokens <= self.tpm:
-                self.events.append((now, tokens))
-                return
-            oldest = min(e[0] for e in self.events)
-            sleep = max(0.5, 60.0 - (now - oldest) + 0.25)
-            print(f"  rate limit: waiting {sleep:.0f}s "
-                  f"({used_req}/{self.rpm} req, {used_tok}/{self.tpm} tok in the last minute)",
-                  end="\r")
-            time.sleep(sleep)
-
-
-def batch_by_tokens(texts, cap=MAX_TOKENS_PER_REQUEST):
-    """Group texts so no request exceeds the per-request token cap."""
-    batches, cur, cur_tokens = [], [], 0
-    for t in texts:
-        n = est_tokens(t)
-        if cur and cur_tokens + n > cap:
-            batches.append(cur)
-            cur, cur_tokens = [], 0
-        cur.append(t)
-        cur_tokens += n
-    if cur:
-        batches.append(cur)
-    return batches
-
-# What the guide reports. The whole point of this script is the comparison.
 PUBLISHED = {
     "baseline":   {5: 80.92, 10: 87.15, 20: 90.06},
     "contextual": {5: 88.12, 10: 92.34, 20: 94.29},
 }
-# Embeddings are deterministic, so a baseline that misses by more than this is a
-# real difference. Stage 2 involves generation at temperature 0, which is close
-# to deterministic but not guaranteed to be identical.
+# Embeddings are deterministic, so a baseline off by more than this is a real
+# difference. Stage 2 generates text at temperature 0 — close to deterministic,
+# not guaranteed identical.
 TOLERANCE = {"baseline": 0.5, "contextual": 2.0}
 
+QUIET = bool(os.getenv("REPRODUCE_QUIET"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 CHUNKS = os.path.join(HERE, "data", "codebase_chunks.json")
 QUERIES = os.path.join(HERE, "data", "evaluation_set.jsonl")
 
 
 def require(module, package=None):
-    """Import, or say plainly what to install. A traceback is not an answer."""
     try:
         return __import__(module)
     except ImportError:
@@ -135,7 +80,71 @@ def load_jsonl(path):
         return [json.loads(line) for line in f]
 
 
-# --------------------------------------------------------------- vector stores
+# ------------------------------------------------------------------- tokens
+# The real tokenizer when it loads, a pessimistic estimate otherwise. An earlier
+# version divided characters by four, which is about right for prose and badly
+# wrong for source code: it undercounted this corpus by 60%, and the very first
+# request went out over the per-minute budget.
+_TOKENIZER, _TRIED = None, False
+
+
+def _tokenizer():
+    global _TOKENIZER, _TRIED
+    if not _TRIED:
+        _TRIED = True
+        try:
+            from tokenizers import Tokenizer
+            _TOKENIZER = Tokenizer.from_pretrained("voyageai/voyage-2")
+            print("  counting tokens with the voyage-2 tokenizer")
+        except Exception:
+            print("  voyage-2 tokenizer unavailable; estimating at 2.5 chars/token")
+    return _TOKENIZER
+
+
+def est_tokens(text):
+    t = _tokenizer()
+    if t is not None:
+        try:
+            return max(1, len(t.encode(text).ids))
+        except Exception:
+            pass
+    return max(1, int(len(text) / 2.5))
+
+
+class RateLimiter:
+    """Holds to a requests-per-minute and a tokens-per-minute budget at once."""
+
+    def __init__(self, rpm, tpm):
+        self.rpm, self.tpm = rpm, tpm
+        self.events = []
+
+    def penalize(self, tokens):
+        """A refused request still counted against the server's window.
+
+        Charge what was attempted, not a punishment. An earlier version spent
+        half the minute per rejection, so two rejections stopped everything for
+        a full minute — a wrong token count turned into dead waiting.
+        """
+        self.events.append((time.time(), tokens))
+
+    def wait_for(self, tokens):
+        while True:
+            now = time.time()
+            self.events = [e for e in self.events if now - e[0] < 60.0]
+            n_req = len(self.events)
+            n_tok = sum(t for _, t in self.events)
+            if n_req < self.rpm and n_tok + tokens <= self.tpm:
+                self.events.append((now, tokens))
+                return
+            oldest = min(e[0] for e in self.events)
+            sleep = max(0.5, 60.0 - (now - oldest) + 0.25)
+            print(f"  waiting {sleep:>4.0f}s for the rate window "
+                  f"({n_req}/{self.rpm} req, {n_tok:,}/{self.tpm:,} tokens)   ",
+                  end="\r")
+            time.sleep(sleep)
+
+
+# ------------------------------------------------------------- vector stores
 class VectorDB:
     """The guide's baseline store: embed each chunk as written."""
 
@@ -145,55 +154,76 @@ class VectorDB:
         voyageai = require("voyageai")
         self.client = voyageai.Client(api_key=need("VOYAGE_API_KEY", "voyageai.com"))
         self.embeddings, self.metadata, self.query_cache = [], [], {}
-        self.limiter = RateLimiter(rpm, tpm)
+        self.limiter = RateLimiter(rpm, int(tpm * BUDGET_FRACTION))
+        self.request_cap = max(400, int(tpm * REQUEST_FRACTION))
+        self._tok = {}
         self.db_path = os.path.join(HERE, "data", f"{self.name}_vector_db.pkl")
 
-    def embed_batch(self, texts):
-        """One request, throttled, retried on a rate-limit answer."""
-        tokens = sum(est_tokens(t) for t in texts)
-        for attempt in range(6):
-            self.limiter.wait_for(tokens)
-            try:
-                return self.client.embed(texts, model=EMBED_MODEL).embeddings
-            except Exception as exc:
-                if "rate limit" not in str(exc).lower() or attempt == 5:
-                    raise
-                back = 20 * (attempt + 1)
-                print(f"  rate limited by the server, backing off {back}s     ")
-                time.sleep(back)
-        raise RuntimeError("unreachable")
+    # -- token accounting ----------------------------------------------------
+    def tokens(self, text):
+        if text not in self._tok:
+            self._tok[text] = est_tokens(text)
+        return self._tok[text]
 
+    # -- embedding -----------------------------------------------------------
     def embed_all(self, texts, label):
-        batches = batch_by_tokens(texts)
-        total_tokens = sum(est_tokens(t) for t in texts)
-        minutes = total_tokens / max(1, self.limiter.tpm)
-        print(f"  {label}: {len(texts)} texts, ~{total_tokens:,} tokens, "
-              f"{len(batches)} requests")
-        print(f"  at {self.limiter.tpm:,} tokens/min this takes about "
-              f"{minutes:.0f} min")
-        out, done = [], 0
-        for b in batches:
-            out.extend(self.embed_batch(b))
-            done += len(b)
-            print(f"  {label}: {done}/{len(texts)}                              ", end="\r")
-        print(f"  {label}: {len(texts)}/{len(texts)} done                       ")
+        """Embed everything, learning the request size the server will accept.
+
+        One loop, no recursion. A refused request shrinks the cap and the batch
+        is rebuilt smaller from the same position, so the run does not depend on
+        the token count being right — only on the error being fixable.
+        """
+        total = sum(self.tokens(t) for t in texts)
+        print(f"  {label}: {len(texts)} texts, {total:,} tokens")
+        print(f"  at {self.limiter.tpm:,} tokens/min that is about "
+              f"{total / max(1, self.limiter.tpm):.0f} min")
+
+        out, i, refused, stuck = [], 0, 0, 0
+        while i < len(texts):
+            batch, used, j = [], 0, i
+            while j < len(texts):
+                n = self.tokens(texts[j])
+                if batch and used + n > self.request_cap:
+                    break
+                batch.append(texts[j])
+                used += n
+                j += 1
+
+            self.limiter.wait_for(used)
+            try:
+                out.extend(self.client.embed(batch, model=EMBED_MODEL).embeddings)
+            except Exception as exc:
+                if "rate limit" not in str(exc).lower():
+                    raise
+                refused += 1
+                self.limiter.penalize(used)
+                if len(batch) > 1:
+                    self.request_cap = max(400, used // 2)
+                    print(f"  refused at {len(batch)} texts ({used:,} tokens); "
+                          f"request cap is now {self.request_cap:,}           ")
+                    continue
+                stuck += 1
+                if stuck > 2:
+                    sys.exit(
+                        f"\n  A single text of {used:,} tokens keeps being refused.\n"
+                        f"  It cannot be split further, so no retry will help: the\n"
+                        f"  account's per-minute token limit is below the size of one\n"
+                        f"  chunk. Raise the limit on the provider, or lower --tpm to\n"
+                        f"  match what the account really allows.")
+                print(f"  one text of {used:,} tokens refused; waiting the window out"
+                      f"          ")
+                time.sleep(1 if QUIET else 61)
+                continue
+            i = j
+            stuck = 0
+            if not QUIET:
+                print(f"  {label}: {i}/{len(texts)}  cap {self.request_cap:,}"
+                      f"  {refused} refused            ", end="\r")
+        print(f"  {label}: {len(texts)}/{len(texts)} done"
+              f"                                   ")
         return out
 
-    def embed_queries(self, queries):
-        """All query embeddings up front, in batches.
-
-        Embedding them one at a time is 248 requests. On the free tier that is
-        over an hour of waiting for 3,600 tokens of text.
-        """
-        unique = sorted({q["query"] for q in queries})
-        missing = [q for q in unique if q not in self.query_cache]
-        if not missing:
-            return
-        vecs = self.embed_all(missing, "queries")
-        for q, v in zip(missing, vecs):
-            self.query_cache[q] = v
-        self.save()
-
+    # -- data ----------------------------------------------------------------
     def texts_and_metadata(self, dataset):
         texts, meta = [], []
         for doc in dataset:
@@ -208,15 +238,13 @@ class VectorDB:
         if os.path.exists(self.db_path):
             with open(self.db_path, "rb") as f:
                 d = pickle.load(f)
-            self.embeddings, self.metadata = d["embeddings"], d["metadata"]
+            self.embeddings = d["embeddings"]
+            self.metadata = d["metadata"]
             self.query_cache = d.get("query_cache", {})
             print(f"  loaded {len(self.embeddings)} embeddings and "
                   f"{len(self.query_cache)} query vectors from cache")
             return
         texts, meta = self.texts_and_metadata(dataset)
-        self.embed_and_store(texts, meta)
-
-    def embed_and_store(self, texts, meta):
         self.embeddings = self.embed_all(texts, "chunks")
         self.metadata = meta
         self.save()
@@ -227,9 +255,23 @@ class VectorDB:
             pickle.dump({"embeddings": self.embeddings, "metadata": self.metadata,
                          "query_cache": self.query_cache}, f)
 
+    def embed_queries(self, queries):
+        """All query vectors up front, in batches.
+
+        One at a time is 248 requests. On the free tier that is over an hour of
+        waiting for a few thousand tokens of text.
+        """
+        unique = sorted({q["query"] for q in queries})
+        missing = [q for q in unique if q not in self.query_cache]
+        if not missing:
+            return
+        for q, v in zip(missing, self.embed_all(missing, "queries")):
+            self.query_cache[q] = v
+        self.save()
+
     def search(self, query, k=20):
         if query not in self.query_cache:
-            self.query_cache[query] = self.embed_batch([query])[0]
+            self.query_cache[query] = self.embed_all([query], "query")[0]
         sims = np.dot(self.embeddings, self.query_cache[query])
         return [{"metadata": self.metadata[i]} for i in np.argsort(sims)[::-1][:k]]
 
@@ -251,10 +293,10 @@ Answer only with the succinct context and nothing else.
 
 
 class ContextualVectorDB(VectorDB):
-    """The guide's contextual store: Claude writes a situating line per chunk,
-    which is prepended to the chunk before embedding. The whole document is sent
-    with each request and cached, so the document is billed once per document
-    rather than once per chunk."""
+    """The guide's contextual store: Claude writes a line situating each chunk in
+    its document, which is prepended before embedding. The document is sent with
+    every request and cached, so it is billed once per document rather than once
+    per chunk."""
 
     name = "contextual"
 
@@ -264,7 +306,7 @@ class ContextualVectorDB(VectorDB):
         self.anthropic = anthropic.Anthropic(
             api_key=need("ANTHROPIC_API_KEY", "console.anthropic.com"))
         self.db_path = os.path.join(HERE, "data", f"{self.name}_vector_db.pkl")
-        self.tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+        self.usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
         self.lock = threading.Lock()
 
     def situate(self, doc, chunk):
@@ -280,13 +322,9 @@ class ContextualVectorDB(VectorDB):
         )
         return r.content[0].text, r.usage
 
-    def load_data(self, dataset, threads=6):
+    def load_data(self, dataset, threads=4):
         if os.path.exists(self.db_path):
-            with open(self.db_path, "rb") as f:
-                d = pickle.load(f)
-            self.embeddings, self.metadata = d["embeddings"], d["metadata"]
-            print(f"  loaded {len(self.embeddings)} embeddings from cache")
-            return
+            return VectorDB.load_data(self, dataset)
 
         jobs = [(doc, ch) for doc in dataset for ch in doc["chunks"]]
         print(f"  situating {len(jobs)} chunks with {MODEL_NAME} ({threads} threads)")
@@ -295,12 +333,12 @@ class ContextualVectorDB(VectorDB):
         def work(doc, chunk):
             text, usage = self.situate(doc["content"], chunk["content"])
             with self.lock:
-                self.tokens["input"] += usage.input_tokens
-                self.tokens["output"] += usage.output_tokens
-                self.tokens["cache_read"] += getattr(usage, "cache_read_input_tokens", 0) or 0
-                self.tokens["cache_creation"] += getattr(usage, "cache_creation_input_tokens", 0) or 0
+                self.usage["input"] += usage.input_tokens
+                self.usage["output"] += usage.output_tokens
+                self.usage["cache_read"] += getattr(usage, "cache_read_input_tokens", 0) or 0
+                self.usage["cache_write"] += getattr(usage, "cache_creation_input_tokens", 0) or 0
                 done[0] += 1
-                print(f"  {done[0]}/{len(jobs)}", end="\r")
+                print(f"  situating: {done[0]}/{len(jobs)}    ", end="\r")
             return {"doc_id": doc["doc_id"], "chunk_id": chunk["chunk_id"],
                     "original_index": chunk["original_index"],
                     "original_content": chunk["content"],
@@ -308,23 +346,27 @@ class ContextualVectorDB(VectorDB):
 
         results = []
         with ThreadPoolExecutor(max_workers=threads) as ex:
-            futures = [ex.submit(work, d, c) for d, c in jobs]
-            for f in as_completed(futures):
+            for f in as_completed([ex.submit(work, d, c) for d, c in jobs]):
                 results.append(f.result())
-        print()
-        t = self.tokens
-        print(f"  tokens: {t['input']} in, {t['output']} out, "
-              f"{t['cache_read']} cache read, {t['cache_creation']} cache written")
-        if t["cache_read"] + t["cache_creation"]:
-            saved = t["cache_read"] / max(1, t["cache_read"] + t["cache_creation"])
-            print(f"  {saved:.0%} of document tokens came from cache rather than being re-billed")
-        self.embed_and_store([r["content"] for r in results], results)
+        print(f"  situating: {len(jobs)}/{len(jobs)} done          ")
+        u = self.usage
+        print(f"  tokens: {u['input']:,} in, {u['output']:,} out, "
+              f"{u['cache_read']:,} from cache, {u['cache_write']:,} written to cache")
+        if u["cache_read"] + u["cache_write"]:
+            share = u["cache_read"] / (u["cache_read"] + u["cache_write"])
+            print(f"  {share:.0%} of document tokens were served from cache "
+                  f"rather than re-billed")
+
+        self.embeddings = self.embed_all([r["content"] for r in results], "chunks")
+        self.metadata = results
+        self.save()
+        print(f"  cached to {os.path.basename(self.db_path)}")
 
 
 # ------------------------------------------------------------------- scoring
 def evaluate(db, queries, k):
-    """The guide's scoring, unchanged: for each query, what share of its golden
-    chunks appear in the top k."""
+    """The guide's scoring, unchanged: per query, what share of its golden chunks
+    appear in the top k."""
     total = 0.0
     for i, item in enumerate(queries, 1):
         golden = []
@@ -346,47 +388,44 @@ def evaluate(db, queries, k):
                     found += 1
                     break
         total += found / len(golden)
-        print(f"  Pass@{k}: {i}/{len(queries)}", end="\r")
-    print(" " * 40, end="\r")
+        print(f"  Pass@{k}: {i}/{len(queries)}   ", end="\r")
+    print(" " * 44, end="\r")
     return 100 * total / len(queries)
 
 
 def report(stage, mine):
-    pub = PUBLISHED[stage]
-    tol = TOLERANCE[stage]
-    print(f"\n{'=' * 64}")
+    pub, tol = PUBLISHED[stage], TOLERANCE[stage]
+    print(f"\n{'=' * 62}")
     print(f"  {stage.upper()}  —  yours against the published guide")
-    print(f"{'=' * 64}")
-    print(f"  {'':8}{'published':>12}{'yours':>10}{'diff':>9}")
+    print(f"{'=' * 62}")
+    print(f"  {'':9}{'published':>12}{'yours':>10}{'diff':>9}")
     ok = True
     for k in K_VALUES:
         d = mine[k] - pub[k]
         within = abs(d) <= tol
         ok = ok and within
-        print(f"  Pass@{k:<4}{pub[k]:>11.2f}%{mine[k]:>9.2f}%{d:>+8.2f}"
-              f"   {'' if within else '  <-- outside tolerance'}")
-    print(f"{'-' * 64}")
+        print(f"  Pass@{k:<5}{pub[k]:>11.2f}%{mine[k]:>9.2f}%{d:>+8.2f}"
+              f"{'' if within else '   <-- outside tolerance'}")
+    print(f"{'-' * 62}")
     print(f"  tolerance: {tol:.1f} points")
     if ok:
-        print(f"\n  REPRODUCED. Your run matches the published benchmark.")
+        print("\n  REPRODUCED. Your run matches the published benchmark.")
     else:
-        print(f"\n  DID NOT MATCH. Something differs — a different embedding model,")
-        print(f"  a partial dataset, or a changed scoring rule. Worth finding before")
-        print(f"  claiming either number.")
-    print(f"{'=' * 64}\n")
+        print("\n  DID NOT MATCH. Something differs — a different embedding model,")
+        print("  a partial dataset, or a changed scoring rule.")
+    print(f"{'=' * 62}\n")
     return ok
 
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = {a.split("=")[0]: a.split("=")[1]
-             for a in sys.argv[1:] if a.startswith("--") and "=" in a}
+    flags = dict(a[2:].split("=", 1) for a in sys.argv[1:]
+                 if a.startswith("--") and "=" in a)
     stage = args[0] if args else "baseline"
     if stage not in PUBLISHED:
         sys.exit(f"stage must be one of: {', '.join(PUBLISHED)}\n"
                  f"  python reproduce.py baseline [--rpm=3] [--tpm=10000]")
-    rpm = int(flags.get("--rpm", FREE_RPM))
-    tpm = int(flags.get("--tpm", FREE_TPM))
+    rpm, tpm = int(flags.get("rpm", FREE_RPM)), int(flags.get("tpm", FREE_TPM))
 
     dataset = json.load(open(CHUNKS, encoding="utf-8"))
     queries = load_jsonl(QUERIES)
@@ -394,8 +433,8 @@ def main():
     print(f"\n{chunks} chunks from {len(dataset)} documents, {len(queries)} queries")
     if (rpm, tpm) == (FREE_RPM, FREE_TPM):
         print("Voyage free tier: 3 requests and 10,000 tokens per minute.")
-        print("With a payment method on file the limits rise and the free token")
-        print("allowance still applies — then pass --rpm=300 --tpm=1000000.\n")
+        print("A payment method raises these and the free token allowance still")
+        print("applies — then pass --rpm=300 --tpm=1000000.\n")
     else:
         print(f"Rate limits: {rpm} requests/min, {tpm:,} tokens/min\n")
 

@@ -61,19 +61,31 @@ python reproduce.py contextual
 ### On Voyage's free tier
 
 Without a payment method on file, Voyage allows **3 requests and 10,000 tokens
-per minute**. The corpus is about 127,000 estimated tokens, so stage 1 takes
-around **13 minutes** and costs nothing. The script respects both limits and
-tells you what it is waiting for.
+per minute**. The corpus is about **199,000 tokens**, so stage 1 takes roughly
+**25 minutes** and costs nothing. The script holds to both limits and prints
+what it is waiting for rather than appearing to hang.
 
-Two things make that possible. Requests are batched by token count rather than
-by a fixed number of chunks, so no single request exceeds the per-minute budget
-— 737 chunks go out as 16 requests. And all 246 unique queries are embedded in
-one batch up front rather than one at a time, which on this tier is the
-difference between one request and over an hour of waiting.
+Three things make that work:
+
+- Requests are sized by token count, not by a fixed number of chunks, and capped
+  well below the per-minute budget rather than at it.
+- All 246 unique queries are embedded in one batch up front. One at a time is
+  248 requests, which on this tier is over an hour of waiting for a few thousand
+  tokens of text.
+- **A refused request is rebuilt smaller rather than retried unchanged.** Token
+  counts are never exact, and retrying an identical over-budget request cannot
+  succeed however long the wait. On a refusal the cap is halved and the batch is
+  rebuilt from the same position, so the run does not depend on the count being
+  right — only on the error being fixable. `test_batching.py` checks this
+  against a stub server whose real limit is below what the script believes.
 
 With a payment method the limits rise sharply and the free token allowance still
 applies, so it still costs nothing — pass `--rpm=300 --tpm=1000000` to run it in
 about a minute.
+
+```bash
+python test_batching.py     # no key, no network
+```
 
 Keys come from [voyageai.com](https://www.voyageai.com/) and
 [console.anthropic.com](https://console.anthropic.com/).
