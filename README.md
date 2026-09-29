@@ -116,6 +116,29 @@ forties.
 Both kinds of number are honest. They answer different questions. Quoting one
 while implying the other is where RAG reporting usually goes wrong.
 
+## What this changes from the guide, and what it does not
+
+The measured path is the guide's: voyage-2 embeddings, dot-product similarity,
+top-k, the same scoring function, the same data, the same prompts byte for byte
+(including the eight-space indentation the guide's class definition gives them —
+that whitespace reaches the model, so it is kept rather than tidied away).
+
+What is different is everything around the measurement, none of which touches
+the result:
+
+- It is a script with stages rather than a notebook, and it caches each stage.
+- Requests are sized by token count, throttled to the account's rate limits, and
+  rebuilt smaller when refused, so it completes on a free tier.
+- Queries are embedded in one batch instead of one request each.
+- Each document's first chunk is sent alone so the document is written to the
+  prompt cache once rather than raced.
+- Spending is tracked against a budget and the run stops if it is exceeded.
+- The result is printed next to the published figures with a verdict.
+
+The exact match on stage 1 — 80.918.../87.149.../90.063... against a published
+80.92/87.15/90.06 — is itself the evidence that the measured path was not
+altered. A changed method would not land on the same hundredths.
+
 ## Where the published guide no longer runs as written
 
 Two things in the cookbook have aged, and both are handled here:

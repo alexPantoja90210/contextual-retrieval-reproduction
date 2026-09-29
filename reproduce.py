@@ -283,20 +283,24 @@ class VectorDB:
         return [{"metadata": self.metadata[i]} for i in np.argsort(sims)[::-1][:k]]
 
 
+# Byte-identical to the guide, indentation included. The guide defines these
+# inside ContextualVectorDB, so each line carries eight leading spaces. That
+# whitespace is part of what reaches the model, so a reproduction keeps it
+# instead of tidying it away.
 DOCUMENT_CONTEXT_PROMPT = """
-<document>
-{doc_content}
-</document>
-"""
+        <document>
+        {doc_content}
+        </document>
+        """
 CHUNK_CONTEXT_PROMPT = """
-Here is the chunk we want to situate within the whole document
-<chunk>
-{chunk_content}
-</chunk>
+        Here is the chunk we want to situate within the whole document
+        <chunk>
+        {chunk_content}
+        </chunk>
 
-Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk.
-Answer only with the succinct context and nothing else.
-"""
+        Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk.
+        Answer only with the succinct context and nothing else.
+        """
 
 
 class ContextualVectorDB(VectorDB):
