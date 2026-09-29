@@ -131,6 +131,15 @@ Two things in the cookbook have aged, and both are handled here:
 
 Neither changes what is measured.
 
+## License and attribution
+
+This repository's own code — `reproduce.py`, `test_batching.py` — is MIT
+licensed. The data files and `guide.ipynb` come from
+[anthropics/claude-cookbooks](https://github.com/anthropics/claude-cookbooks),
+also MIT licensed, copyright Anthropic, and are included unchanged so the
+benchmark runs from a clone. The published figures being matched are theirs.
+See [LICENSE](LICENSE).
+
 ## Source
 
 The data, the retrieval code and the published figures are Anthropic's:
