@@ -133,12 +133,17 @@ question, and it is not one the guide answers.
 
 The harness can answer it, because the baseline above reproduced the published
 figures. An instrument that reads true on a known answer can be pointed at an
-unknown one. So the embedding provider is swappable, and a second provider is
-included: **Amazon Titan Text Embeddings V2**, through Bedrock.
+unknown one. So the embedding provider is swappable, and two more are included:
+
+| `--embedder=` | Model | Needs |
+|---|---|---|
+| `voyage` | voyage-2, 1024d | `VOYAGE_API_KEY` (default) |
+| `arctic` | Snowflake Arctic Embed L v2.0, 1024d | nothing — runs locally |
+| `titan` | Amazon Titan Text Embeddings V2, 1024d | AWS credentials ([setup](BEDROCK-SETUP.md)) |
 
 ```bash
-python reproduce.py baseline   --embedder=titan
-python reproduce.py contextual --embedder=titan
+python reproduce.py baseline   --embedder=arctic
+python reproduce.py contextual --embedder=arctic
 python consolidate.py
 ```
 
@@ -160,7 +165,47 @@ What they produce is a measurement placed next to another measurement:
 | voyage-2, this repo | +6.53 | +4.95 | +4.93 |
 | titan-embed-v2 | — | — | — |
 
-`consolidate.py` fills the last row and writes `RESULTS.md`.
+`consolidate.py` fills the remaining rows and writes `RESULTS.md`.
+
+### Why the context window decides which model can answer this
+
+The obvious open-source model at 1024 dimensions is `bge-large-en-v1.5`, and it
+is the wrong one here. It caps at **512 tokens**, and on this corpus that cap is
+not evenly distributed:
+
+| | Texts over 512 tokens |
+|---|---|
+| Baseline chunks | 1 of 737 (0.1%) |
+| Contextual chunks | **67 of 737 (9.1%)** |
+
+The situating line Claude prepends lifts the median chunk from 261 to 399
+tokens. A 512-token model would therefore truncate the contextual run 67 times
+more often than the baseline — and a small measured gain would be unreadable:
+technique failing to transfer, or model never seeing the context? The bias runs
+against the technique, which is the worst direction for it to run.
+
+Arctic Embed L v2.0 has an 8192-token window, so nothing is truncated. It is
+also 1024 dimensions, matching voyage-2, and needs no `trust_remote_code`, so no
+code from a model repository is executed. `gte-large-en-v1.5` is the other
+1024-by-8192 option and does require it.
+
+Arctic asks for a `query:` prefix on queries and not on passages, so the
+embedding interface carries a `kind`. voyage-2 ignores it deliberately: Voyage
+offers an `input_type` the guide does not pass, and this column has to stay the
+reproduction rather than an improved version of it.
+
+The local column needs no key, no account and no per-token cost. Anyone who
+clones this repository can run it, which is not true of any hosted provider.
+
+```bash
+python -m pip install sentence-transformers
+python reproduce.py baseline --embedder=arctic
+```
+
+The first run downloads about 2.3 GB of model weights and then works offline.
+The run reports the longest text it saw and the sequence limit actually in
+effect, and counts anything truncated — a shorter window than expected shows up
+in the output rather than quietly depressing a number.
 
 Setup is in [BEDROCK-SETUP.md](BEDROCK-SETUP.md): a scoped IAM user limited to
 one action on one model in one region, and the CLI profile. There is no model

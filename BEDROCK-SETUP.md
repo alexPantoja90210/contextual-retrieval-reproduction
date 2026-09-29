@@ -97,6 +97,28 @@ The reproduction itself — the voyage-2 baseline landing on Anthropic's
 published Pass@5/10/20 — is what makes that measurement worth reading. It is
 the evidence the harness reads true.
 
+## If you get Error 002
+
+`ValidationException: Error 002: Access to Bedrock models is not allowed for
+this account` is not an IAM problem and no policy will fix it. It is an
+account-level restriction: the request was signed and authorized, and the
+service refused it afterwards. A missing permission produces
+`AccessDeniedException` instead, and the two strings are distinct for this
+reason.
+
+The check that separates them takes a minute. Open any model in the Bedrock
+console playground with an administrator identity. If listing and selecting
+models works but invoking fails with the same Error 002, the account is
+restricted and nothing configurable will change it.
+
+The error is not in Bedrock's published list of API error codes. Reported
+causes include accounts without payment history and organization-level Service
+Control Policies. The route is a support case under **Account and billing**,
+which needs no paid support plan.
+
+Meanwhile `--embedder=arctic` runs the same benchmark locally with no account
+at all.
+
 ## Teardown
 
 Nothing here runs when you are not running it. There is no infrastructure to

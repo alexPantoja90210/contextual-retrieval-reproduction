@@ -31,6 +31,7 @@ PUBLISHED = {
 # label, filename suffix, the command that produces it
 RUNS = [
     ("voyage-2", "", "python reproduce.py {stage}"),
+    ("arctic-embed-l-v2", "_arctic", "python reproduce.py {stage} --embedder=arctic"),
     ("titan-embed-v2", "_titan", "python reproduce.py {stage} --embedder=titan"),
 ]
 STAGES = ["baseline", "contextual"]
@@ -103,7 +104,7 @@ def main():
         out.append("")
 
     if len(complete) >= 2:
-        a, b = complete[0], complete[1]
+        a, b = complete[0], complete[1]   # voyage-2 first, then the next finished
         ga = {k: found[(a, "contextual")][k] - found[(a, "baseline")][k]
               for k in K_VALUES}
         gb = {k: found[(b, "contextual")][k] - found[(b, "baseline")][k]

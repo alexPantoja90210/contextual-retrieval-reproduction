@@ -170,7 +170,7 @@ class VectorDB:
         return self._tok[text]
 
     # -- embedding -----------------------------------------------------------
-    def embed_all(self, texts, label):
+    def embed_all(self, texts, label, kind="passage"):
         """Embed everything, learning the request size the server will accept.
 
         One loop, no recursion. A refused request shrinks the cap and the batch
@@ -200,7 +200,7 @@ class VectorDB:
 
             self.limiter.wait_for(used)
             try:
-                out.extend(self.embedder.embed(batch))
+                out.extend(self.embedder.embed(batch, kind=kind))
             except Exception as exc:
                 if "rate limit" not in str(exc).lower():
                     raise
@@ -274,13 +274,14 @@ class VectorDB:
         missing = [q for q in unique if q not in self.query_cache]
         if not missing:
             return
-        for q, v in zip(missing, self.embed_all(missing, "queries")):
+        for q, v in zip(missing, self.embed_all(missing, "queries", kind="query")):
             self.query_cache[q] = v
         self.save()
 
     def search(self, query, k=20):
         if query not in self.query_cache:
-            self.query_cache[query] = self.embed_all([query], "query")[0]
+            self.query_cache[query] = self.embed_all([query], "query",
+                                                      kind="query")[0]
         sims = np.dot(self.embeddings, self.query_cache[query])
         return [{"metadata": self.metadata[i]} for i in np.argsort(sims)[::-1][:k]]
 

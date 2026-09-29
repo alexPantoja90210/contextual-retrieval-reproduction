@@ -182,7 +182,7 @@ def the_batch_cap_is_honoured_by_the_caller():
         def count(self, text):
             return 1
 
-        def embed(self, texts):
+        def embed(self, texts, kind="passage"):
             self.sizes.append(len(texts))
             return [[0.0] * DIMENSIONS for _ in texts]
 
@@ -198,9 +198,94 @@ def the_batch_cap_is_honoured_by_the_caller():
     return f"30 texts in batches of {stub.sizes}, cap 7"
 
 
+class _FixedTokenizer:
+    """Returns a scripted token count per call, so length is under test."""
+
+    def __init__(self, counts=None):
+        self.counts, self.i = counts, 0
+
+    def encode(self, text, add_special_tokens=None):
+        if self.counts is None:
+            return [0] * max(1, len(text) // 4)
+        n = self.counts[self.i]
+        self.i += 1
+        return [0] * n
+
+
+class FakeSentenceTransformer:
+    """Stands in for the downloaded model: records how each text was encoded.
+
+    encode() and tokenizer.encode() are different methods with the same name
+    in sentence-transformers, so the tokenizer is a separate object here. An
+    earlier version of this stub defined both on one class and the second
+    silently replaced the first.
+    """
+
+    def __init__(self, dim=DIMENSIONS, limit=8192):
+        self.dim, self.max_seq_length = dim, limit
+        self.seen = []
+        self.tokenizer = _FixedTokenizer()
+
+    def encode(self, texts, normalize_embeddings=None, show_progress_bar=None,
+               prompt_name=None):
+        import types
+        assert normalize_embeddings is True, "vectors must be normalized"
+        self.seen.append((prompt_name, list(texts)))
+        return [types.SimpleNamespace(tolist=lambda n=len(x): [float(n)] * self.dim)
+                for x in texts]
+
+    def get_sentence_embedding_dimension(self):
+        return self.dim
+
+
+def make_local(limit=8192, dim=DIMENSIONS):
+    """A LocalEmbedder wired to the fake model, with no download."""
+    from embedders import LocalEmbedder
+    e = LocalEmbedder.__new__(LocalEmbedder)
+    e.st = FakeSentenceTransformer(dim=dim, limit=limit)
+    e.limit, e.truncated, e.longest = limit, 0, 0
+    return e
+
+
+@case
+def the_query_prefix_goes_on_queries_and_not_on_passages():
+    """Arctic asks for a prefix on queries only. Both mistakes — applying it
+    everywhere, or nowhere — cost retrieval accuracy silently and look exactly
+    like the model being worse than it is."""
+    e = make_local()
+    e.embed(["a chunk of code"], kind="passage")
+    e.embed(["how do I parse this"], kind="query")
+    prompts = [p for p, _ in e.st.seen]
+    assert prompts == [None, "query"], prompts
+    return "passage: no prompt; query: prompt_name='query'"
+
+
+@case
+def passage_is_the_default_so_a_missed_kind_cannot_prefix_a_chunk():
+    e = make_local()
+    e.embed(["a chunk"])
+    assert e.st.seen[0][0] is None, e.st.seen
+    return "default kind is passage"
+
+
+@case
+def truncation_is_counted_and_named_rather_than_silent():
+    """A model whose window is shorter than the corpus biases the comparison,
+    because contextual chunks are longer than baseline ones. The run has to
+    say so; silence here would look like a clean result."""
+    e = make_local(limit=100)
+    e.st.tokenizer = _FixedTokenizer([150, 50, 300])
+    for t in ("a", "b", "c"):
+        e.count(t)
+    line = e.report()
+    assert e.truncated == 2, e.truncated
+    assert "truncated" in line and "understates" in line, line
+    return "2 of 3 over the limit, and the report says the bias direction"
+
+
 def main():
     print(f"\n{'=' * 62}")
-    print("  Bedrock embedding path — offline checks")
+    print("  Embedding providers — offline checks")
     print(f"{'=' * 62}")
     failed = 0
     for fn in CASES:

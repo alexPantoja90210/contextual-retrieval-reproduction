@@ -66,8 +66,12 @@ class Embedder:
         the batching loop recovers from an undercount by shrinking."""
         raise NotImplementedError
 
-    def embed(self, texts):
-        """Vectors for texts, in the same order. Raises on unrecoverable error."""
+    def embed(self, texts, kind="passage"):
+        """Vectors for texts, in the same order. Raises on unrecoverable error.
+
+        `kind` is "passage" or "query". Some models want a prefix on queries
+        and not on passages; providers that do not distinguish ignore it.
+        """
         raise NotImplementedError
 
     def report(self):
@@ -113,7 +117,11 @@ class VoyageEmbedder(Embedder):
                 pass
         return max(1, int(len(text) / 2.5))
 
-    def embed(self, texts):
+    def embed(self, texts, kind="passage"):
+        # Voyage takes an input_type that distinguishes queries from documents.
+        # The guide does not pass it, and this column has to stay the
+        # reproduction, so it is not passed here either. Using it would
+        # probably score better and would no longer be the published method.
         return self.client.embed(texts, model=self.model).embeddings
 
 
@@ -212,7 +220,8 @@ class BedrockEmbedder(Embedder):
             return payload["embedding"]
         raise RuntimeError("unreachable")
 
-    def embed(self, texts):
+    def embed(self, texts, kind="passage"):
+        # Titan v2 has no query/passage distinction in its request body.
         if len(texts) == 1:
             return [self._one(texts[0])]
         with ThreadPoolExecutor(max_workers=self.threads) as ex:
@@ -232,7 +241,100 @@ class BedrockEmbedder(Embedder):
         return line
 
 
-PROVIDERS = {c.key: c for c in (VoyageEmbedder, BedrockEmbedder)}
+
+
+# ----------------------------------------------------------------------- local
+# Chosen over bge-large-en-v1.5, which is the obvious open-source model at this
+# width, because bge caps at 512 tokens. On this corpus that cap truncates 1 of
+# 737 baseline chunks and 67 of 737 contextual ones: the situating line Claude
+# prepends lifts the median chunk from 261 to 399 tokens, so a 512-token model
+# would cut the contextual run 67 times more often than the baseline. A small
+# measured gain would then be unreadable — technique failing to transfer, or
+# model never seeing the context? The bias runs against the technique, which is
+# the worst direction for it to run. 8192 tokens removes the question.
+#
+# gte-large-en-v1.5 is the other 1024-by-8192 option and needs
+# trust_remote_code=True. This one does not, so no code from a model repository
+# is executed here.
+ARCTIC_MAX_TOKENS = 8192
+
+
+class LocalEmbedder(Embedder):
+    """Snowflake Arctic Embed L v2.0, on this machine.
+
+    No API, no key, no account, no per-token cost. Anyone who clones the
+    repository can run this column of the table, which is not true of any
+    hosted provider.
+    """
+
+    key = "arctic"
+    model = "Snowflake/snowflake-arctic-embed-l-v2.0"
+    label = "arctic-embed-l-v2"
+    max_texts = 16
+    # Nothing is rate limited: the model runs here. The limiter stays in the
+    # path rather than being special-cased out, so one code path serves every
+    # provider; these numbers simply never bind.
+    default_rpm, default_tpm = 10 ** 6, 10 ** 9
+    suffix = "_arctic"
+
+    def __init__(self):
+        st = require("sentence_transformers", "sentence-transformers")
+        print(f"  loading {self.model} (first run downloads about 2.3 GB)")
+        self.st = st.SentenceTransformer(self.model)
+        self.truncated = 0
+        self.longest = 0
+
+        # sentence-transformers reports the length it will actually enforce,
+        # which can sit below what the architecture supports. Asking for the
+        # full window and then reading the value back is the only way to know
+        # what this install will do, rather than what the model card says.
+        try:
+            self.st.max_seq_length = ARCTIC_MAX_TOKENS
+        except Exception:
+            pass
+        self.limit = int(getattr(self.st, "max_seq_length", 0) or 0)
+        print(f"  maximum sequence length in effect: {self.limit or 'unknown'} tokens")
+
+        dim = self.st.get_sentence_embedding_dimension()
+        if dim != DIMENSIONS:
+            sys.exit(f"\n  {self.model} returns {dim} dimensions, not {DIMENSIONS}.\n"
+                     f"  The comparison holds width fixed, so a different width\n"
+                     f"  would measure the width alongside the model.")
+
+    def count(self, text):
+        # The model's own tokenizer, so this is exact rather than estimated.
+        n = len(self.st.tokenizer.encode(text, add_special_tokens=False))
+        self.longest = max(self.longest, n)
+        if self.limit and n > self.limit:
+            self.truncated += 1
+        return max(1, n)
+
+    def embed(self, texts, kind="passage"):
+        # Arctic asks for a prefix on queries only. Applying it to passages, or
+        # omitting it from queries, quietly costs retrieval accuracy and looks
+        # exactly like the model being worse.
+        kwargs = {"prompt_name": "query"} if kind == "query" else {}
+        out = self.st.encode(list(texts), normalize_embeddings=True,
+                             show_progress_bar=False, **kwargs)
+        return [v.tolist() for v in out]
+
+    def report(self):
+        line = f"  longest text seen: {self.longest:,} tokens"
+        if self.limit:
+            line += f", limit {self.limit:,}"
+        if self.truncated:
+            line += (f"\n  {self.truncated} texts exceeded the limit and were "
+                     f"truncated.\n"
+                     f"  Truncation is not symmetric across stages — contextual "
+                     f"chunks are longer\n"
+                     f"  than baseline ones — so a gain measured under it "
+                     f"understates the technique.")
+        else:
+            line += "\n  nothing was truncated"
+        return line
+
+
+PROVIDERS = {c.key: c for c in (VoyageEmbedder, BedrockEmbedder, LocalEmbedder)}
 
 
 def make_embedder(key):

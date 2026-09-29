@@ -22,6 +22,8 @@ known golden chunk. Retrieval is dot-product over normalized
 
 ## Not yet run
 
+- arctic-embed-l-v2, baseline — `python reproduce.py baseline --embedder=arctic`
+- arctic-embed-l-v2, contextual — `python reproduce.py contextual --embedder=arctic`
 - titan-embed-v2, baseline — `python reproduce.py baseline --embedder=titan`
 - titan-embed-v2, contextual — `python reproduce.py contextual --embedder=titan`
 

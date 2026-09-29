@@ -49,7 +49,7 @@ class RefusingEmbedder:
         # count being wrong is the condition, not a flaw in the test.
         return max(1, int(len(text) / 2.5))
 
-    def embed(self, texts):
+    def embed(self, texts, kind="passage"):
         self.calls += 1
         tokens = sum(self.count(t) for t in texts)
         if tokens > self.limit:
