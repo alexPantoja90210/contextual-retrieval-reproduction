@@ -134,17 +134,21 @@ def persistent_throttling_raises_rather_than_returning_short():
 
 
 @case
-def access_denied_names_both_causes():
-    """IAM permission and Bedrock model access are separate grants. A message
-    that mentions only one sends you to the wrong console page."""
+def access_denied_points_at_the_causes_that_still_exist():
+    """Bedrock's Model access page has been retired: serverless foundation
+    models enable themselves on first invocation. A message that still sends
+    the reader to that page costs them a trip to a console screen that no
+    longer exists, so the text is asserted rather than trusted."""
     e = make(FakeBedrock(fail_with="AccessDeniedException"), threads=1)
     try:
         e.embed(["a"])
     except SystemExit as exc:
         msg = str(exc)
         assert "bedrock:InvokeModel" in msg, msg
-        assert "Model access" in msg, msg
-        return "names IAM and model access separately"
+        assert "retired" in msg, msg
+        assert "us-east-1" in msg, msg
+        assert "Model access page" in msg, msg
+        return "names IAM, region and account policy; says the page is retired"
     raise AssertionError("did not exit")
 
 

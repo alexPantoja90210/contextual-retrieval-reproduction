@@ -162,8 +162,10 @@ What they produce is a measurement placed next to another measurement:
 
 `consolidate.py` fills the last row and writes `RESULTS.md`.
 
-Setup is in [BEDROCK-SETUP.md](BEDROCK-SETUP.md): model access, a scoped IAM
-user limited to one action on one model in one region, and the CLI profile.
+Setup is in [BEDROCK-SETUP.md](BEDROCK-SETUP.md): a scoped IAM user limited to
+one action on one model in one region, and the CLI profile. There is no model
+activation step — Bedrock's Model access page has been retired and serverless
+foundation models enable themselves on first invocation.
 Titan Embed v2 is $0.02 per million input tokens, so both stages together cost
 a few cents. Nothing is left running — there is no vector store, no index and
 no infrastructure to delete.

@@ -184,12 +184,15 @@ class BedrockEmbedder(Embedder):
                 if code == "AccessDeniedException":
                     sys.exit(
                         f"\n  Bedrock refused the call: {code}.\n"
-                        f"  Two things cause this, and they are different:\n"
+                        f"  Bedrock's Model access page has been retired — serverless\n"
+                        f"  foundation models enable themselves on first invocation, so\n"
+                        f"  there is no activation step to have missed. What is left:\n"
                         f"    1. The IAM identity lacks bedrock:InvokeModel on\n"
-                        f"       {self.model} in {self.region}.\n"
-                        f"    2. Model access for Titan Embed v2 has not been granted\n"
-                        f"       on this account. Bedrock console > Model access.\n"
-                        f"  Both are required. Granting one does not imply the other.")
+                        f"       {self.model}.\n"
+                        f"    2. The policy names a different region than {self.region}.\n"
+                        f"    3. A Service Control Policy or permissions boundary on the\n"
+                        f"       account overrides the grant.\n"
+                        f"  See BEDROCK-SETUP.md.")
                 if code == "ValidationException" and "too long" in str(exc).lower():
                     sys.exit(
                         f"\n  A chunk of about {self.count(text):,} estimated tokens "

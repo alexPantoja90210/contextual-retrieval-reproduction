@@ -16,17 +16,23 @@ contextualized chunks the voyage-2 run already wrote to
 text being embedded is byte-identical across the two runs, so the embedding
 model is the only variable.
 
-## 1. Grant model access
+## Model access: nothing to do
 
-Model access is per account and per region, and it is separate from IAM. An
-identity with full Bedrock permissions still gets `AccessDeniedException`
-until this is done.
+Bedrock's **Model access** page has been retired. Serverless foundation models
+are enabled automatically across commercial regions the first time an account
+invokes them, so Titan Embed v2 needs no activation step — IAM permission is
+now the only gate.
 
-1. Bedrock console, region **us-east-1**.
-2. **Model access** in the left navigation.
-3. Enable **Titan Text Embeddings V2**. It is granted immediately.
+Two exceptions, neither of which applies here: Anthropic models may ask a
+first-time user for use-case details, and Marketplace-served models still need
+one invocation by a user with Marketplace permissions. Titan is a first-party
+serverless model and is covered by neither.
 
-## 2. Create a scoped IAM user
+If an `AccessDeniedException` survives a correct IAM policy, the remaining
+causes are an account-level Service Control Policy or a permissions boundary,
+not a missing activation.
+
+## 1. Create a scoped IAM user
 
 Never root-account access keys. The policy in `iam-policy-titan-embed.json`
 allows one action on one model in one region and nothing else.
@@ -41,7 +47,7 @@ allows one action on one model in one region and nothing else.
 
 Copy the key and secret into the CLI in the next step. They are shown once.
 
-## 3. Configure the CLI
+## 2. Configure the CLI
 
 ```powershell
 aws configure --profile titan-embed
@@ -65,9 +71,10 @@ aws bedrock-runtime invoke-model `
 ```
 
 A `ValidationException` here is a formatting problem with the command. An
-`AccessDeniedException` means step 1 or step 2 is incomplete.
+`AccessDeniedException` means the IAM policy is not attached, names a different
+region, or is overridden by an account-level policy.
 
-## 4. Run
+## 3. Run
 
 ```powershell
 python test_embedders.py                            # offline, no AWS needed
