@@ -1,0 +1,21 @@
+{
+  "stage": "baseline",
+  "embedder": "arctic",
+  "mine": {
+    "5": 76.77611367127494,
+    "10": 82.73809523809524,
+    "20": 88.78648233486945
+  },
+  "published": null,
+  "reference": {
+    "5": 80.91877880184332,
+    "10": 87.14957757296467,
+    "20": 90.06336405529954
+  },
+  "matched": true,
+  "chunks": 737,
+  "queries": 248,
+  "embed_model": "arctic-embed-l-v2",
+  "dimensions": 1024,
+  "model": null
+}

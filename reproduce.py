@@ -565,10 +565,13 @@ def report_swap(stage, mine, embedder, ref):
             print(f"  Pass@{k:<5}{mine[k]:>9.2f}%")
         print(f"{'=' * 62}\n")
         return True
-    print(f"  {'':9}{'voyage-2':>12}{embedder.label:>16}{'diff':>9}")
+    # Sized to the label: "arctic-embed-l-v2" overflowed a fixed 16 and ran
+    # into the column beside it.
+    w = max(12, len(embedder.label) + 2)
+    print(f"  {'':9}{'voyage-2':>12}{embedder.label:>{w}}{'diff':>9}")
     for k in K_VALUES:
         d = mine[k] - ref[k]
-        print(f"  Pass@{k:<5}{ref[k]:>11.2f}%{mine[k]:>15.2f}%{d:>+8.2f}")
+        print(f"  Pass@{k:<5}{ref[k]:>11.2f}%{mine[k]:>{w - 1}.2f}%{d:>+8.2f}")
     print(f"{'-' * 62}")
     print(f"  Same {DIMENSIONS} dimensions, same chunks, same queries, same scoring.")
     print("  The embedding model is the only difference between these columns.")
