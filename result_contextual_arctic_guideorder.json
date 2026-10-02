@@ -1,0 +1,19 @@
+{
+  "probe": "concatenation order",
+  "embedder": "arctic",
+  "order": "context_then_chunk",
+  "mine": {
+    "5": 86.90956221198157,
+    "10": 91.7002688172043,
+    "20": 94.5228494623656
+  },
+  "repo_order_chunk_then_context": {
+    "5": 86.10311059907833,
+    "10": 91.0954301075269,
+    "20": 94.6236559139785
+  },
+  "chunks": 737,
+  "queries": 248,
+  "embed_model": "arctic-embed-l-v2",
+  "dimensions": 1024
+}

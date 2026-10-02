@@ -376,6 +376,29 @@ def the_endpoint_gets_the_api_path_exactly_once():
     return "bare, trailing slash, and already-pathed all normalize the same"
 
 
+@case
+def the_offline_embedder_carries_identity_without_building_anything():
+    """What lets the hybrid stage run with no key and no model download."""
+    e = embedders.make_embedder("azure", offline=True)
+    assert e.suffix == "_azure", e.suffix
+    assert e.label == "text-embedding-3-large", e.label
+    assert e.key == "azure", e.key
+    return "suffix and label present, no client constructed"
+
+
+@case
+def the_offline_embedder_refuses_to_embed():
+    """A stage that quietly started embedding would still produce a Pass@k."""
+    e = embedders.make_embedder("arctic", offline=True)
+    for method, args in (("embed", (["text"],)), ("count", ("text",))):
+        try:
+            getattr(e, method)(*args)
+        except RuntimeError:
+            continue
+        raise AssertionError(f"{method} returned instead of refusing")
+    return "embed and count both raise"
+
+
 def main():
     print(f"\n{'=' * 62}")
     print("  Embedding providers — offline checks")

@@ -1,0 +1,21 @@
+{
+  "stage": "hybrid",
+  "embedder": "voyage",
+  "mine": {
+    "5": 88.18644393241166,
+    "10": 92.11309523809524,
+    "20": 95.43010752688173
+  },
+  "published": {
+    "5": 86.43,
+    "10": 93.21,
+    "20": 94.99
+  },
+  "reference": null,
+  "matched": true,
+  "chunks": 737,
+  "queries": 248,
+  "embed_model": "voyage-2",
+  "dimensions": 1024,
+  "model": null
+}

@@ -26,6 +26,7 @@ K_VALUES = [5, 10, 20]
 PUBLISHED = {
     "baseline":   {5: 80.92, 10: 87.15, 20: 90.06},
     "contextual": {5: 88.12, 10: 92.34, 20: 94.29},
+    "hybrid":     {5: 86.43, 10: 93.21, 20: 94.99},
 }
 
 # label, filename suffix, the command that produces it
@@ -36,7 +37,7 @@ RUNS = [
     ("text-embedding-3-large", "_azure",
      "python reproduce.py {stage} --embedder=azure"),
 ]
-STAGES = ["baseline", "contextual"]
+STAGES = ["baseline", "contextual", "hybrid"]
 
 
 def load(stage, suffix):
@@ -232,6 +233,142 @@ def main():
                    f"{'model' if n == 2 else 'models'}, measured through a harness "
                    f"whose {RUNS[0][0]} baseline reproduced their published figures "
                    f"to the hundredth.")
+        out.append("")
+
+    probe = os.path.join(HERE, "result_contextual_arctic_guideorder.json")
+    if os.path.exists(probe):
+        with open(probe, encoding="utf-8") as f:
+            d = json.load(f)
+        theirs = {int(k): v for k, v in d["mine"].items()}
+        ours = {int(k): v for k, v in d["repo_order_chunk_then_context"].items()}
+
+        out.append("## A known deviation from the guide, measured")
+        out.append("")
+        out.append("The guide embeds the generated context BEFORE the chunk. This "
+                   "harness has always put it after. Same words, different order, "
+                   "which an embedding model reads and a keyword index does not. "
+                   "Rather than leave that for a reader to find, probe_order.py "
+                   "re-embeds the same 737 chunks with the same context text in the "
+                   "guide's order, reusing the cached query vectors, and scores it "
+                   "with the same evaluate(). Only the word order differs.")
+        out.append("")
+        out.append("| arctic-embed-l-v2, contextual | @5 | @10 | @20 |")
+        out.append("| --- | --- | --- | --- |")
+        out.append("| chunk first (this harness) |" +
+                   "".join(f" {ours[k]:.2f} |" for k in K_VALUES))
+        out.append("| context first (the guide) |" +
+                   "".join(f" {theirs[k]:.2f} |" for k in K_VALUES))
+        out.append("| difference |" +
+                   "".join(f" {theirs[k] - ours[k]:+.2f} |" for k in K_VALUES))
+        out.append("")
+        out.append(f"The guide's order is worth {theirs[5] - ours[5]:+.2f} at k=5 and "
+                   f"{theirs[10] - ours[10]:+.2f} at k=10, and {theirs[20] - ours[20]:+.2f} "
+                   f"at k=20 -- it costs a little at the widest k, where both orders "
+                   f"are already above 94%. The sign is not the same at every k, so "
+                   f"this is a small effect with structure, not a uniform improvement.")
+        out.append("")
+        out.append(f"That magnitude matters for one specific claim. This harness's "
+                   f"{RUNS[0][0]} contextual run came in 0.67 below the published "
+                   f"figure at k=5 while its baseline reproduced to the hundredth, "
+                   f"and {theirs[5] - ours[5]:+.2f} on a different embedder is the "
+                   f"same order of magnitude as that gap. Plausible explanation, not "
+                   f"a demonstrated one: the probe ran on arctic-embed-l-v2, and only "
+                   f"a {RUNS[0][0]} run could settle it.")
+        out.append("")
+        out.append("The order is left as written. Every column in the tables above "
+                   "shares it, so the comparisons between embedders are unaffected: "
+                   "all three read the same text, byte for byte. What it affects is "
+                   "the comparison against Anthropic's published contextual row, "
+                   "which is why it is stated here instead of being corrected "
+                   "quietly after the numbers were already published.")
+        out.append("")
+
+    fused = [label for label in complete if (label, "hybrid") in found]
+    if fused:
+        out.append("## What the keyword fusion adds, on top of contextual")
+        out.append("")
+        out.append("The keyword side reads chunk text only, so its ranking is the "
+                   "same for every embedder. Whatever separates these three columns "
+                   "arrived from the dense side.")
+        out.append("")
+        out.append("| Embedder | @5 | @10 | @20 |")
+        out.append("| --- | --- | --- | --- |")
+        for label in fused:
+            out.append(gain_row(label, found[(label, "contextual")],
+                                found[(label, "hybrid")]))
+        out.append("")
+        out.append("The same gains as a share of the error that was still left "
+                   "after contextual chunking -- the headroom correction, applied a "
+                   "second time so the two interventions can be read on one scale:")
+        out.append("")
+        out.append("| Embedder | @5 | @10 | @20 |")
+        out.append("| --- | --- | --- | --- |")
+        for label in fused:
+            b, c = found[(label, "contextual")], found[(label, "hybrid")]
+            cells = "".join(f" {100 * (c[k] - b[k]) / (100 - b[k]):.1f}% |" for k in K_VALUES)
+            out.append(f"| {label} |{cells}")
+        out.append("")
+
+        order = sorted(fused, key=lambda l: found[(l, "contextual")][5])
+        share = {l: {k: 100 * (found[(l, "hybrid")][k] - found[(l, "contextual")][k])
+                     / (100 - found[(l, "contextual")][k]) for k in K_VALUES}
+                 for l in fused}
+        repeats = all(share[order[i]][k] > share[order[i + 1]][k]
+                      for k in K_VALUES for i in range(len(order) - 1))
+
+        out.append("### The same ordering, from a different mechanism")
+        out.append("")
+        if repeats and len(order) >= 3:
+            out.append(f"Ranked by their contextual score, {' then '.join(order)} runs "
+                       f"weakest to strongest, and the share of remaining error that "
+                       f"the keyword fusion closes falls in that same order at every "
+                       f"k: " +
+                       ", ".join(f"{' / '.join(f'{share[l][k]:.1f}%' for l in order)} at k={k}"
+                                 for k in K_VALUES) + ".")
+            out.append("")
+            out.append("That is the second time this ordering appears, and the two "
+                       "interventions have nothing in common. One writes a line of "
+                       "generated prose in front of a chunk and re-embeds it. The "
+                       "other leaves the vectors untouched and merges in a ranking "
+                       "built from word counts. Both pay off in inverse proportion "
+                       "to how good the dense retriever already was.")
+            out.append("")
+        out.append("A prediction written down before these three runs: that the "
+                   "fusion would LOSE at k=5, because the published table drops from "
+                   "88.12 to 86.43 there. It gained on all three embedders. Whatever "
+                   "produces that drop in the published row is particular to that "
+                   "setup, and the local keyword engine is one candidate among "
+                   "several. The prediction is left here because it was wrong, which "
+                   "is the only reason it is worth anything.")
+        out.append("")
+
+        def spread(stage, k):
+            vals = [found[(l, stage)][k] for l in fused]
+            return max(vals) - min(vals)
+
+        out.append("### Where the three end up")
+        out.append("")
+        out.append("| Spread between the embedders | @5 | @10 | @20 |")
+        out.append("| --- | --- | --- | --- |")
+        for stage in STAGES:
+            out.append(f"| after {stage} |" +
+                       "".join(f" {spread(stage, k):.2f} |" for k in K_VALUES))
+        out.append("")
+        best_base = sorted(fused, key=lambda l: -found[(l, "baseline")][5])
+        best_fused = sorted(fused, key=lambda l: -found[(l, "hybrid")][5])
+        if best_base == best_fused[::-1]:
+            out.append(f"At k=5 the ordering is exactly reversed. {best_base[0]} has "
+                       f"the best baseline and the worst hybrid score; "
+                       f"{best_base[-1]} has the worst baseline and the best hybrid "
+                       f"score. The three span "
+                       f"{spread('baseline', 5):.2f} points before either technique "
+                       f"and {spread('hybrid', 5):.2f} after both.")
+            out.append("")
+        out.append("At k=20 the spread stops narrowing: "
+                   f"{spread('contextual', 20):.2f} after contextual and "
+                   f"{spread('hybrid', 20):.2f} after fusion. Convergence is not a "
+                   "law here, it is what these two techniques happen to do at the "
+                   "values of k where there is still room to move.")
         out.append("")
 
     if missing:

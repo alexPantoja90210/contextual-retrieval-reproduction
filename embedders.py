@@ -482,7 +482,35 @@ PROVIDERS = {c.key: c for c in (VoyageEmbedder, BedrockEmbedder,
                                 LocalEmbedder, AzureEmbedder)}
 
 
-def make_embedder(key):
+class OfflineEmbedder(Embedder):
+    """Carries a provider's identity without constructing it.
+
+    A stage that only reads vectors already on disk still needs the provider's
+    suffix, to find the right cache, and its label, to print. Constructing the
+    real one would demand a key or load 2.3 GB for work that never happens, and
+    would leave a stage that cannot reach a network looking like one that can.
+
+    Every embedding method raises. A stage that quietly started embedding would
+    still produce a Pass@k, and the number would look fine.
+    """
+
+    def __init__(self, provider):
+        for attr in ("key", "model", "label", "suffix",
+                     "max_texts", "default_rpm", "default_tpm"):
+            setattr(self, attr, getattr(provider, attr))
+
+    def _refuse(self, *_args, **_kwargs):
+        raise RuntimeError(
+            f"this stage must not embed, but something asked {self.label} to. "
+            "The vectors it needs were written by an earlier stage.")
+
+    count = embed = _refuse
+
+
+def make_embedder(key, offline=False):
+    """Build a provider, or just its identity when no embedding will happen."""
     if key not in PROVIDERS:
         sys.exit(f"--embedder must be one of: {', '.join(PROVIDERS)}")
+    if offline:
+        return OfflineEmbedder(PROVIDERS[key])
     return PROVIDERS[key]()

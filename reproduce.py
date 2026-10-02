@@ -70,6 +70,12 @@ DEFAULT_BUDGET = 1.50
 PUBLISHED = {
     "baseline":   {5: 80.92, 10: 87.15, 20: 90.06},
     "contextual": {5: 88.12, 10: 92.34, 20: 94.29},
+    # The guide's third row. Printed for orientation, never as a target: its
+    # keyword side is Elasticsearch and this one is not, so the two are not
+    # expected to meet. See bm25.py for what was matched and what was not.
+    # Worth noticing before running anything -- the published Pass@5 FALLS here,
+    # 88.12 to 86.43, which the guide's own prose does not mention.
+    "hybrid":     {5: 86.43, 10: 93.21, 20: 94.99},
 }
 # Embeddings are deterministic, so a baseline off by more than this is a real
 # difference. Stage 2 generates text at temperature 0 — close to deterministic,
@@ -425,6 +431,26 @@ class ContextualVectorDB(VectorDB):
         print(f"  budget: ${self.budget:.2f} — the run stops if it is exceeded")
         done, results = [0], []
 
+        # KNOWN DEVIATION FROM THE GUIDE, kept deliberately.
+        #
+        # The guide embeds the generated context BEFORE the chunk:
+        #     f"{contextualized_text}\n\n{chunk['content']}"
+        # This line has always put it after. Both orders carry the same words,
+        # so the difference is word order alone, which an embedding model can
+        # read and a bag-of-words retriever cannot.
+        #
+        # probe_order.py measures it rather than guessing. On arctic-embed-l-v2:
+        # Pass@5 +0.81, Pass@10 +0.60, Pass@20 -0.10 in the guide's favour at
+        # the first two values of k and against it at the third. That is the
+        # same order of magnitude as the gap between this harness's voyage-2
+        # contextual run and the published figure (0.67 at k=5), so the order
+        # is a plausible explanation for that gap -- plausible, not shown: the
+        # probe ran on a different embedder.
+        #
+        # It stays as written so the three embedder columns remain comparable
+        # to each other and to the numbers already published from them.
+        # Changing it is a one-character edit and two re-runs; what it costs is
+        # every contextual figure in RESULTS.md.
         def entry(doc, chunk, text):
             return {"doc_id": doc["doc_id"], "chunk_id": chunk["chunk_id"],
                     "original_index": chunk["original_index"],
@@ -483,6 +509,77 @@ class ContextualVectorDB(VectorDB):
 
 
 # ------------------------------------------------------------------- scoring
+CONTEXT_SEPARATOR = "\n\n"
+
+
+def contextualized_text(meta):
+    """The generated context alone, recovered from the stored combined text.
+
+    The contextual stage stores `content` as original + separator + context (see
+    the deviation note above). The guide's keyword index treats the generated
+    context as a field of its own, so it has to be recovered: indexing the
+    combined string instead would count every word of the chunk twice and change
+    the document frequencies of the whole corpus.
+
+    Checked per chunk rather than assumed. A silently truncated field would
+    still produce a ranking, and the ranking would still produce a Pass@k.
+    """
+    original, combined = meta["original_content"], meta["content"]
+    head = original + CONTEXT_SEPARATOR
+    if not combined.startswith(head):
+        sys.exit(f"chunk {meta['chunk_id']} is not original + separator + context; "
+                 "the assumption about the stored layout is wrong")
+    return combined[len(head):]
+
+
+class HybridDB:
+    """The guide's hybrid retrieval: the dense ranking fused with a keyword one.
+
+    Wraps a contextual store instead of extending it, because nothing about the
+    embedding path changes here -- the vectors are the ones already on disk and
+    no model is called. Both recall lists are computed once per query and reused
+    across the three values of k; retrieval is deterministic, so that is the same
+    work the guide repeats three times.
+
+    The keyword side reads only chunk text, so it is identical for every
+    embedder. That is what makes three hybrid columns comparable: whatever
+    separates them came from the dense side alone.
+    """
+
+    RECALL = 150            # the guide's num_chunks_to_recall
+    SEMANTIC_WEIGHT = 0.8
+    BM25_WEIGHT = 0.2
+
+    def __init__(self, db, index):
+        self.db = db
+        self.index = index
+        self.metadata = db.metadata
+        self._recall = {}
+        self.reset_counts()
+
+    def reset_counts(self):
+        self.from_semantic = self.from_keyword = self.returned = 0.0
+
+    def search(self, query, k=20):
+        if query not in self._recall:
+            self._recall[query] = (self.db.search(query, k=self.RECALL),
+                                   self.index.search(query, k=self.RECALL))
+        semantic, keyword = self._recall[query]
+        out, s, b = bm25_fuse(semantic, keyword, k,
+                              self.SEMANTIC_WEIGHT, self.BM25_WEIGHT)
+        self.from_semantic += s
+        self.from_keyword += b
+        self.returned += len(out)
+        return out
+
+    def split(self):
+        """Share of returned chunks each side put there, as the guide reports it."""
+        if not self.returned:
+            return 0.0, 0.0
+        return (100 * self.from_semantic / self.returned,
+                100 * self.from_keyword / self.returned)
+
+
 def evaluate(db, queries, k):
     """The guide's scoring, unchanged: per query, what share of its golden chunks
     appear in the top k."""
@@ -507,7 +604,10 @@ def evaluate(db, queries, k):
                     found += 1
                     break
         total += found / len(golden)
-        print(f"  Pass@{k}: {i}/{len(queries)}   ", end="\r")
+        if sys.stdout.isatty():
+            # \r only overwrites on a terminal. Redirected, it would print
+            # one line per query and bury the result it is counting towards.
+            print(f"  Pass@{k}: {i}/{len(queries)}   ", end="\r")
     print(" " * 44, end="\r")
     return 100 * total / len(queries)
 
@@ -580,6 +680,38 @@ def report_swap(stage, mine, embedder, ref):
     return True
 
 
+def report_hybrid(mine, embedder, contextual, split):
+    """Places the hybrid run next to the same embedder's contextual run.
+
+    No pass or fail. The keyword engine here is not Elasticsearch, so agreement
+    with the published row would be luck and disagreement would mean nothing.
+    What the column answers is the question one embedder can answer about
+    itself: does fusing a keyword ranking in move its own number, and where.
+    """
+    width = 62
+    print(f"\n{'=' * width}")
+    print(f"  HYBRID  —  {embedder.label}, contextual with BM25 fused in")
+    print(f"{'=' * width}")
+    print(f"  {'':9}{'contextual':>13}{'hybrid':>12}{'diff':>9}")
+    for k in K_VALUES:
+        if contextual and k in contextual:
+            print(f"  Pass@{k:<4}{contextual[k]:>12.2f}%{mine[k]:>11.2f}%"
+                  f"{mine[k] - contextual[k]:>+9.2f}")
+        else:
+            print(f"  Pass@{k:<4}{'—':>13}{mine[k]:>11.2f}%{'':>9}")
+    print(f"{'-' * width}")
+    sem, kw = split
+    print(f"  Of the chunks returned, {sem:.1f}% came from the dense ranking")
+    print(f"  and {kw:.1f}% from BM25, counting a chunk found by both as half")
+    print("  to each.")
+    print()
+    print("  The guide published 86.43 / 93.21 / 94.99 here, on Elasticsearch.")
+    print("  This keyword side is a local reimplementation, so that row is")
+    print("  context for reading this one, not a target it should meet.")
+    print(f"{'=' * width}")
+    return True
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = dict(a[2:].split("=", 1) for a in sys.argv[1:]
@@ -588,7 +720,10 @@ def main():
     if stage not in PUBLISHED:
         sys.exit(f"stage must be one of: {', '.join(PUBLISHED)}\n"
                  f"  python reproduce.py baseline [--embedder=voyage|titan]")
-    embedder = make_embedder(flags.get("embedder", "voyage"))
+    # The hybrid stage reads vectors off disk and never embeds, so it does
+    # not build a provider: no key is demanded and no model is loaded.
+    embedder = make_embedder(flags.get("embedder", "voyage"),
+                             offline=(stage == "hybrid"))
     rpm = int(flags["rpm"]) if "rpm" in flags else embedder.default_rpm
     tpm = int(flags["tpm"]) if "tpm" in flags else embedder.default_tpm
     budget = float(flags.get("budget", DEFAULT_BUDGET))
@@ -609,15 +744,47 @@ def main():
     db = (VectorDB(embedder, rpm=rpm, tpm=tpm) if stage == "baseline"
           else ContextualVectorDB(embedder, rpm=rpm, tpm=tpm, budget=budget))
     db.load_data(dataset)
-    db.embed_queries(queries)
+
+    target, contextual, split = db, None, None
+    if stage == "hybrid":
+        # This stage must not reach the network. Everything it needs was written
+        # by the contextual stage: the chunk vectors, the query vectors and the
+        # context text. If any query vector were absent the run would quietly
+        # start embedding, which is exactly the surprise worth refusing.
+        absent = {q["query"] for q in queries} - set(db.query_cache)
+        if absent:
+            sys.exit(
+                f"{len(absent)} query vectors are not cached. Run\n"
+                f"  python reproduce.py contextual --embedder={embedder.key}\n"
+                "first; the hybrid stage never calls an embedding model.")
+        require("snowballstemmer")
+        from bm25 import Bm25Index, fuse as _fuse
+        globals()["bm25_fuse"] = _fuse
+        meta = [dict(m, contextualized_content=contextualized_text(m))
+                for m in db.metadata]
+        print(f"  building the keyword index over {len(meta)} chunks, two fields")
+        target = HybridDB(db, Bm25Index(meta))
+        path = os.path.join(HERE, f"result_contextual{embedder.suffix}.json")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                contextual = {int(k): v for k, v in json.load(f)["mine"].items()}
+        print("  no embedding model is called in this stage\n")
+    else:
+        db.embed_queries(queries)
 
     mine = {}
     for k in K_VALUES:
-        mine[k] = evaluate(db, queries, k)
+        if stage == "hybrid":
+            target.reset_counts()
+        mine[k] = evaluate(target, queries, k)
         print(f"  Pass@{k}: {mine[k]:.2f}%")
+        if stage == "hybrid":
+            split = target.split()
 
     ref = load_reference(stage) if embedder.suffix else None
-    if embedder.key == "voyage":
+    if stage == "hybrid":
+        ok = report_hybrid(mine, embedder, contextual, split)
+    elif embedder.key == "voyage":
         ok = report_published(stage, mine)
     else:
         ok = report_swap(stage, mine, embedder, ref)
