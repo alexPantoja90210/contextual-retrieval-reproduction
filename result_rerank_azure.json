@@ -1,0 +1,21 @@
+{
+  "stage": "rerank",
+  "embedder": "azure",
+  "mine": {
+    "5": 92.45391705069125,
+    "10": 95.497311827957,
+    "20": 96.9758064516129
+  },
+  "published": null,
+  "reference": {
+    "5": 92.45391705069125,
+    "10": 95.497311827957,
+    "20": 96.9758064516129
+  },
+  "matched": true,
+  "chunks": 737,
+  "queries": 248,
+  "embed_model": "text-embedding-3-large",
+  "dimensions": 1024,
+  "model": null
+}

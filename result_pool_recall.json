@@ -1,0 +1,23 @@
+{
+  "pool": 200,
+  "queries": 248,
+  "recall": {
+    "voyage-2": 99.52956989247313,
+    "arctic-embed-l-v2": 99.4287634408602,
+    "text-embedding-3-large": 99.6975806451613
+  },
+  "overlap": {
+    "voyage-2 vs arctic-embed-l-v2": {
+      "chunks": 109.8024193548387,
+      "percent": 54.90120967741936
+    },
+    "voyage-2 vs text-embedding-3-large": {
+      "chunks": 113.53225806451613,
+      "percent": 56.76612903225807
+    },
+    "arctic-embed-l-v2 vs text-embedding-3-large": {
+      "chunks": 115.57661290322581,
+      "percent": 57.788306451612904
+    }
+  }
+}

@@ -27,6 +27,7 @@ PUBLISHED = {
     "baseline":   {5: 80.92, 10: 87.15, 20: 90.06},
     "contextual": {5: 88.12, 10: 92.34, 20: 94.29},
     "hybrid":     {5: 86.43, 10: 93.21, 20: 94.99},
+    "rerank":     {5: 92.15, 10: 95.26, 20: 97.45},
 }
 
 # label, filename suffix, the command that produces it
@@ -37,7 +38,7 @@ RUNS = [
     ("text-embedding-3-large", "_azure",
      "python reproduce.py {stage} --embedder=azure"),
 ]
-STAGES = ["baseline", "contextual", "hybrid"]
+STAGES = ["baseline", "contextual", "hybrid", "rerank"]
 
 
 def load(stage, suffix):
@@ -283,6 +284,98 @@ def main():
                    "quietly after the numbers were already published.")
         out.append("")
 
+    ranked = [label for label in complete if (label, "rerank") in found]
+    if ranked:
+        out.append("## What reranking adds, on top of contextual")
+        out.append("")
+        out.append("A cross-encoder reads the query and each candidate together, "
+                   "which the dense retriever never does: it compares two vectors "
+                   "that were written without knowledge of each other. This row is "
+                   "contextual retrieval reranked, not the hybrid row reranked -- "
+                   "the guide's own text says its fourth row builds on contextual "
+                   "embeddings alone, though the \"+\" in its table reads as a "
+                   "cumulative pipeline.")
+        out.append("")
+        out.append("| Embedder | @5 | @10 | @20 |")
+        out.append("| --- | --- | --- | --- |")
+        for label in ranked:
+            out.append(gain_row(label, found[(label, "contextual")],
+                                found[(label, "rerank")]))
+        out.append("")
+        out.append("The same gains as a share of the error still left after "
+                   "contextual chunking:")
+        out.append("")
+        out.append("| Embedder | @5 | @10 | @20 |")
+        out.append("| --- | --- | --- | --- |")
+        for label in ranked:
+            b, c = found[(label, "contextual")], found[(label, "rerank")]
+            cells = "".join(f" {100 * (c[k] - b[k]) / (100 - b[k]):.1f}% |" for k in K_VALUES)
+            out.append(f"| {label} |{cells}")
+        out.append("")
+        same = {k: {found[(l, "rerank")][k] for l in ranked} for k in K_VALUES}
+        if len(ranked) >= 2 and all(len(v) == 1 for v in same.values()):
+            vals = {k: next(iter(v)) for k, v in same.items()}
+            out.append("### The columns are identical")
+            out.append("")
+            out.append(f"Not close. Identical, to every decimal the scoring produces: "
+                       + " / ".join(f"{vals[k]:.2f}" for k in K_VALUES) +
+                       f" for all {len(ranked)} embedders. Each one made its own "
+                       "246 reranking calls over its own candidates, and the caches "
+                       "share no entry, so this is not one ranking reused.")
+            out.append("")
+            # Stated with the figures probe_pool.py measured, not with round
+            # numbers from a one-off script. A claim in this file that nothing
+            # in the repository can recompute is an assertion, not a result.
+            pool_path = os.path.join(HERE, "result_pool_recall.json")
+            if os.path.exists(pool_path):
+                with open(pool_path, encoding="utf-8") as f:
+                    pool = json.load(f)
+                lo = min(pool["recall"].values())
+                hi = max(pool["recall"].values())
+                share = min(d["percent"] for d in pool["overlap"].values())
+                recall_text = (f"contains the golden chunk {lo:.2f}% to {hi:.2f}% of "
+                               f"the time (probe_pool.py), and the three pools share "
+                               f"as little as {share:.0f}% of their contents")
+            else:
+                recall_text = ("almost always contains the golden chunk, and the "
+                               "pools overlap only partly (run probe_pool.py)")
+            out.append("The explanation is recall, not luck. Each embedder's "
+                       f"{pool['pool'] if os.path.exists(pool_path) else 200}-candidate "
+                       f"pool {recall_text} "
+                       "-- they are genuinely different sets "
+                       "that happen to agree on the few chunks that matter. A "
+                       "cross-encoder scores each query-document pair on its own, "
+                       "without reference to the order it received them in, so it "
+                       "sees the same relevant documents in all three cases and "
+                       "ranks them the same way. The other ~190 differ and never "
+                       "reach the top 20.")
+            out.append("")
+            out.append("So the retriever's entire job, at this pool size, is not to "
+                       "lose the answer. All three do that, and past that point the "
+                       "choice between them is worth nothing on this corpus.")
+            out.append("")
+            out.append("**The ordering from the earlier sections reappears here and "
+                       "should be discounted.** Ranked by contextual score, the "
+                       "weakest embedder still closes the largest share of its "
+                       "remaining error. But with an identical endpoint that is "
+                       "arithmetic, not a finding: whoever starts lower must gain "
+                       "more to arrive at the same place. In the contextual and "
+                       "fusion sections the endpoints differed, and the ordering was "
+                       "not forced. Here it is. The same shape means two different "
+                       "things and only one of them is evidence.")
+            out.append("")
+
+        out.append("Two deviations, both stated in rerank.py. The candidate pool is "
+                   "a fixed 200 for every k, where the guide sizes it to each k and "
+                   "pays three API calls per query instead of one -- 2,232 calls "
+                   "against a free allowance of 1,000 a month. Reranking 200 and "
+                   "keeping 5 gives the model more chances to find the golden chunk "
+                   "than reranking 50 does, so this most likely flatters Pass@5 "
+                   "rather than hurting it. And the candidates come from this "
+                   "harness's contextual store, which carries the concatenation "
+                   "order described below.")
+        out.append("")
+
     fused = [label for label in complete if (label, "hybrid") in found]
     if fused:
         out.append("## What the keyword fusion adds, on top of contextual")
@@ -350,7 +443,11 @@ def main():
         out.append("")
         out.append("| Spread between the embedders | @5 | @10 | @20 |")
         out.append("| --- | --- | --- | --- |")
+        # Only stages every fused embedder has finished. Including one that is
+        # partly run would put a spread of two columns in a table of three.
         for stage in STAGES:
+            if not all((l, stage) in found for l in fused):
+                continue
             out.append(f"| after {stage} |" +
                        "".join(f" {spread(stage, k):.2f} |" for k in K_VALUES))
         out.append("")

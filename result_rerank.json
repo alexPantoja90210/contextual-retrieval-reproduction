@@ -1,0 +1,21 @@
+{
+  "stage": "rerank",
+  "embedder": "voyage",
+  "mine": {
+    "5": 92.45391705069125,
+    "10": 95.497311827957,
+    "20": 96.9758064516129
+  },
+  "published": {
+    "5": 92.15,
+    "10": 95.26,
+    "20": 97.45
+  },
+  "reference": null,
+  "matched": true,
+  "chunks": 737,
+  "queries": 248,
+  "embed_model": "voyage-2",
+  "dimensions": 1024,
+  "model": null
+}

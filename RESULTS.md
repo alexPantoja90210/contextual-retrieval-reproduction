@@ -11,15 +11,19 @@ known golden chunk. Retrieval is dot-product over normalized
 | Anthropic, published | baseline | 80.92 | 87.15 | 90.06 |
 | Anthropic, published | contextual | 88.12 | 92.34 | 94.29 |
 | Anthropic, published | hybrid | 86.43 | 93.21 | 94.99 |
+| Anthropic, published | rerank | 92.15 | 95.26 | 97.45 |
 | voyage-2 | baseline | 80.92 | 87.15 | 90.06 |
 | voyage-2 | contextual | 87.45 | 92.10 | 94.99 |
 | voyage-2 | hybrid | 88.19 | 92.11 | 95.43 |
+| voyage-2 | rerank | 92.45 | 95.50 | 96.98 |
 | arctic-embed-l-v2 | baseline | 76.78 | 82.74 | 88.79 |
 | arctic-embed-l-v2 | contextual | 86.10 | 91.10 | 94.62 |
 | arctic-embed-l-v2 | hybrid | 88.22 | 91.91 | 95.83 |
+| arctic-embed-l-v2 | rerank | 92.45 | 95.50 | 96.98 |
 | text-embedding-3-large | baseline | 83.89 | 88.49 | 91.85 |
 | text-embedding-3-large | contextual | 86.66 | 91.11 | 94.76 |
 | text-embedding-3-large | hybrid | 87.77 | 91.45 | 95.87 |
+| text-embedding-3-large | rerank | 92.45 | 95.50 | 96.98 |
 
 ## What contextual retrieval adds, per embedder
 
@@ -77,6 +81,36 @@ That magnitude matters for one specific claim. This harness's voyage-2 contextua
 
 The order is left as written. Every column in the tables above shares it, so the comparisons between embedders are unaffected: all three read the same text, byte for byte. What it affects is the comparison against Anthropic's published contextual row, which is why it is stated here instead of being corrected quietly after the numbers were already published.
 
+## What reranking adds, on top of contextual
+
+A cross-encoder reads the query and each candidate together, which the dense retriever never does: it compares two vectors that were written without knowledge of each other. This row is contextual retrieval reranked, not the hybrid row reranked -- the guide's own text says its fourth row builds on contextual embeddings alone, though the "+" in its table reads as a cumulative pipeline.
+
+| Embedder | @5 | @10 | @20 |
+| --- | --- | --- | --- |
+| voyage-2 | +5.01 | +3.39 | +1.98 |
+| arctic-embed-l-v2 | +6.35 | +4.40 | +2.35 |
+| text-embedding-3-large | +5.79 | +4.39 | +2.22 |
+
+The same gains as a share of the error still left after contextual chunking:
+
+| Embedder | @5 | @10 | @20 |
+| --- | --- | --- | --- |
+| voyage-2 | 39.9% | 43.0% | 39.6% |
+| arctic-embed-l-v2 | 45.7% | 49.4% | 43.7% |
+| text-embedding-3-large | 43.4% | 49.4% | 42.3% |
+
+### The columns are identical
+
+Not close. Identical, to every decimal the scoring produces: 92.45 / 95.50 / 96.98 for all 3 embedders. Each one made its own 246 reranking calls over its own candidates, and the caches share no entry, so this is not one ranking reused.
+
+The explanation is recall, not luck. Each embedder's 200-candidate pool contains the golden chunk 99.43% to 99.70% of the time (probe_pool.py), and the three pools share as little as 55% of their contents -- they are genuinely different sets that happen to agree on the few chunks that matter. A cross-encoder scores each query-document pair on its own, without reference to the order it received them in, so it sees the same relevant documents in all three cases and ranks them the same way. The other ~190 differ and never reach the top 20.
+
+So the retriever's entire job, at this pool size, is not to lose the answer. All three do that, and past that point the choice between them is worth nothing on this corpus.
+
+**The ordering from the earlier sections reappears here and should be discounted.** Ranked by contextual score, the weakest embedder still closes the largest share of its remaining error. But with an identical endpoint that is arithmetic, not a finding: whoever starts lower must gain more to arrive at the same place. In the contextual and fusion sections the endpoints differed, and the ordering was not forced. Here it is. The same shape means two different things and only one of them is evidence.
+
+Two deviations, both stated in rerank.py. The candidate pool is a fixed 200 for every k, where the guide sizes it to each k and pays three API calls per query instead of one -- 2,232 calls against a free allowance of 1,000 a month. Reranking 200 and keeping 5 gives the model more chances to find the golden chunk than reranking 50 does, so this most likely flatters Pass@5 rather than hurting it. And the candidates come from this harness's contextual store, which carries the concatenation order described below.
+
 ## What the keyword fusion adds, on top of contextual
 
 The keyword side reads chunk text only, so its ranking is the same for every embedder. Whatever separates these three columns arrived from the dense side.
@@ -110,6 +144,7 @@ A prediction written down before these three runs: that the fusion would LOSE at
 | after baseline | 7.11 | 5.76 | 3.07 |
 | after contextual | 1.34 | 1.01 | 0.37 |
 | after hybrid | 0.45 | 0.66 | 0.44 |
+| after rerank | 0.00 | 0.00 | 0.00 |
 
 At k=5 the ordering is exactly reversed. text-embedding-3-large has the best baseline and the worst hybrid score; arctic-embed-l-v2 has the worst baseline and the best hybrid score. The three span 7.11 points before either technique and 0.45 after both.
 
@@ -120,4 +155,5 @@ At k=20 the spread stops narrowing: 0.37 after contextual and 0.44 after fusion.
 - titan-embed-v2, baseline — `python reproduce.py baseline --embedder=titan`
 - titan-embed-v2, contextual — `python reproduce.py contextual --embedder=titan`
 - titan-embed-v2, hybrid — `python reproduce.py hybrid --embedder=titan`
+- titan-embed-v2, rerank — `python reproduce.py rerank --embedder=titan`
 

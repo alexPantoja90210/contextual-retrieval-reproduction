@@ -76,11 +76,19 @@ PUBLISHED = {
     # Worth noticing before running anything -- the published Pass@5 FALLS here,
     # 88.12 to 86.43, which the guide's own prose does not mention.
     "hybrid":     {5: 86.43, 10: 93.21, 20: 94.99},
+    # The guide's fourth row. Note what its own text says and its table does not:
+    # this row is contextual plus reranking, NOT the hybrid row plus reranking.
+    # The "+" column headings read as a cumulative pipeline and are not one.
+    "rerank":     {5: 92.15, 10: 95.26, 20: 97.45},
 }
 # Embeddings are deterministic, so a baseline off by more than this is a real
 # difference. Stage 2 generates text at temperature 0 — close to deterministic,
 # not guaranteed identical.
 TOLERANCE = {"baseline": 0.5, "contextual": 2.0}
+
+# One embedder's worth of reranking, plus a little slack. Deliberately below
+# the 1,000-call monthly trial allowance so a first run cannot spend it all.
+DEFAULT_CALLS = 260
 
 QUIET = bool(os.getenv("REPRODUCE_QUIET"))
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -532,6 +540,47 @@ def contextualized_text(meta):
     return combined[len(head):]
 
 
+class RerankDB:
+    """Contextual retrieval with a Cohere reranker over a fixed candidate pool.
+
+    One ranking per query, read at three values of k. The guide reranks a pool
+    sized to each k and so pays three calls per query; this pays one, which is
+    what fits the free trial allowance. rerank.py states what that costs in
+    comparability.
+    """
+
+    def __init__(self, db, reranker, contexts):
+        self.db = db
+        self.reranker = reranker
+        self.contexts = contexts        # chunk key -> the generated context
+        self.metadata = db.metadata
+        self._pool = {}
+
+    def candidates(self, query):
+        if query not in self._pool:
+            self._pool[query] = self.db.search(query, k=rerank_lib.CANDIDATES)
+        return self._pool[query]
+
+    def work_item(self, query):
+        """Everything one call needs, without making it.
+
+        Returned before any call so the stage can count what a run would spend
+        and refuse to begin rather than stopping halfway through a quota.
+        """
+        pool = self.candidates(query)
+        ids = [bm25_chunk_key(r["metadata"]) for r in pool]
+        key = rerank_lib.candidate_key(query, ids)
+        docs = [rerank_lib.document_text(r["metadata"], self.contexts[i])
+                for r, i in zip(pool, ids)]
+        return key, query, docs
+
+    def search(self, query, k=20):
+        key, q, docs = self.work_item(query)
+        order = self.reranker.rank(key, q, docs)
+        pool = self.candidates(query)
+        return [{"metadata": pool[i]["metadata"]} for i in order[:k]]
+
+
 class HybridDB:
     """The guide's hybrid retrieval: the dense ranking fused with a keyword one.
 
@@ -680,6 +729,31 @@ def report_swap(stage, mine, embedder, ref):
     return True
 
 
+def report_rerank(mine, embedder, contextual, reranker):
+    """Places the rerank run next to the same embedder's contextual run."""
+    width = 62
+    print(f"\n{'=' * width}")
+    print(f"  RERANK  —  {embedder.label}, contextual reranked by {rerank_lib.MODEL}")
+    print(f"{'=' * width}")
+    print(f"  {'':9}{'contextual':>13}{'reranked':>12}{'diff':>9}")
+    for k in K_VALUES:
+        if contextual and k in contextual:
+            print(f"  Pass@{k:<4}{contextual[k]:>12.2f}%{mine[k]:>11.2f}%"
+                  f"{mine[k] - contextual[k]:>+9.2f}")
+        else:
+            print(f"  Pass@{k:<4}{'—':>13}{mine[k]:>11.2f}%{'':>9}")
+    print(f"{'-' * width}")
+    print(reranker.report())
+    print(f"  one ranking per query over {rerank_lib.CANDIDATES} candidates, read at")
+    print("  all three values of k. The guide ranks a pool sized to each k.")
+    print()
+    print("  The guide published 92.15 / 95.26 / 97.45 here, on the same model")
+    print("  but its own candidate pools, and on its contextual store rather")
+    print("  than this one.")
+    print(f"{'=' * width}")
+    return True
+
+
 def report_hybrid(mine, embedder, contextual, split):
     """Places the hybrid run next to the same embedder's contextual run.
 
@@ -722,8 +796,11 @@ def main():
                  f"  python reproduce.py baseline [--embedder=voyage|titan]")
     # The hybrid stage reads vectors off disk and never embeds, so it does
     # not build a provider: no key is demanded and no model is loaded.
+    # Neither the hybrid nor the rerank stage embeds anything: both read vectors
+    # the contextual stage already wrote. Building a provider would demand a key
+    # or load a model for work that never happens.
     embedder = make_embedder(flags.get("embedder", "voyage"),
-                             offline=(stage == "hybrid"))
+                             offline=(stage in ("hybrid", "rerank")))
     rpm = int(flags["rpm"]) if "rpm" in flags else embedder.default_rpm
     tpm = int(flags["tpm"]) if "tpm" in flags else embedder.default_tpm
     budget = float(flags.get("budget", DEFAULT_BUDGET))
@@ -745,8 +822,48 @@ def main():
           else ContextualVectorDB(embedder, rpm=rpm, tpm=tpm, budget=budget))
     db.load_data(dataset)
 
-    target, contextual, split = db, None, None
-    if stage == "hybrid":
+    target, contextual, split, reranker = db, None, None, None
+    if stage in ("hybrid", "rerank"):
+        # Neither stage may reach an embedding model. Everything they need was
+        # written by the contextual stage. A missing query vector would make the
+        # run start embedding, which is the surprise worth refusing.
+        absent = {q["query"] for q in queries} - set(db.query_cache)
+        if absent:
+            sys.exit(
+                f"{len(absent)} query vectors are not cached. Run\n"
+                f"  python reproduce.py contextual --embedder={embedder.key}\n"
+                "first; this stage never calls an embedding model.")
+        path = os.path.join(HERE, f"result_contextual{embedder.suffix}.json")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                contextual = {int(k): v for k, v in json.load(f)["mine"].items()}
+
+    if stage == "rerank":
+        import rerank as _rerank
+        globals()["rerank_lib"] = _rerank
+        from bm25 import chunk_key as _ck
+        globals()["bm25_chunk_key"] = _ck
+        contexts = {_ck(m): contextualized_text(m) for m in db.metadata}
+        budget = int(flags.get("calls", DEFAULT_CALLS))
+        cache = os.path.join(HERE, "data",
+                             f"rerank{embedder.suffix}_cache.json")
+        reranker = _rerank.Reranker(cache, budget)
+        target = RerankDB(db, reranker, contexts)
+
+        # Price the run before starting it. A trial key allows 1,000 calls a
+        # month; stopping halfway through one is how the rest of the month is
+        # lost, so the count is printed and the budget checked up front.
+        work = [target.work_item(q["query"]) for q in queries]
+        need = reranker.missing(work)
+        mins = need * _rerank.SECONDS_PER_CALL / 60
+        print(f"  {len(work)} queries, {len(work) - need} already cached")
+        print(f"  this run would make {need} new Cohere calls "
+              f"to {_rerank.MODEL}")
+        print(f"  at {_rerank.TRIAL_RPM} requests/min that is about {mins:.0f} min")
+        if need > budget:
+            sys.exit(f"  budget is {budget}. Pass --calls={need} to allow it.")
+        print(f"  budget: {budget}\n")
+    elif stage == "hybrid":
         # This stage must not reach the network. Everything it needs was written
         # by the contextual stage: the chunk vectors, the query vectors and the
         # context text. If any query vector were absent the run would quietly
@@ -758,16 +875,13 @@ def main():
                 f"  python reproduce.py contextual --embedder={embedder.key}\n"
                 "first; the hybrid stage never calls an embedding model.")
         require("snowballstemmer")
-        from bm25 import Bm25Index, fuse as _fuse
+        from bm25 import Bm25Index, fuse as _fuse, chunk_key as _ck
         globals()["bm25_fuse"] = _fuse
+        globals()["bm25_chunk_key"] = _ck
         meta = [dict(m, contextualized_content=contextualized_text(m))
                 for m in db.metadata]
         print(f"  building the keyword index over {len(meta)} chunks, two fields")
         target = HybridDB(db, Bm25Index(meta))
-        path = os.path.join(HERE, f"result_contextual{embedder.suffix}.json")
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                contextual = {int(k): v for k, v in json.load(f)["mine"].items()}
         print("  no embedding model is called in this stage\n")
     else:
         db.embed_queries(queries)
@@ -782,7 +896,9 @@ def main():
             split = target.split()
 
     ref = load_reference(stage) if embedder.suffix else None
-    if stage == "hybrid":
+    if stage == "rerank":
+        ok = report_rerank(mine, embedder, contextual, reranker)
+    elif stage == "hybrid":
         ok = report_hybrid(mine, embedder, contextual, split)
     elif embedder.key == "voyage":
         ok = report_published(stage, mine)

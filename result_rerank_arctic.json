@@ -1,0 +1,17 @@
+{
+  "stage": "rerank",
+  "embedder": "arctic",
+  "mine": {
+    "5": 92.45391705069125,
+    "10": 95.497311827957,
+    "20": 96.9758064516129
+  },
+  "published": null,
+  "reference": null,
+  "matched": true,
+  "chunks": 737,
+  "queries": 248,
+  "embed_model": "arctic-embed-l-v2",
+  "dimensions": 1024,
+  "model": null
+}
