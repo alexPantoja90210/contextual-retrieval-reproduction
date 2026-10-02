@@ -33,6 +33,8 @@ RUNS = [
     ("voyage-2", "", "python reproduce.py {stage}"),
     ("arctic-embed-l-v2", "_arctic", "python reproduce.py {stage} --embedder=arctic"),
     ("titan-embed-v2", "_titan", "python reproduce.py {stage} --embedder=titan"),
+    ("text-embedding-3-large", "_azure",
+     "python reproduce.py {stage} --embedder=azure"),
 ]
 STAGES = ["baseline", "contextual"]
 

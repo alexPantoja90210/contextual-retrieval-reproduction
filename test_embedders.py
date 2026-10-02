@@ -283,6 +283,99 @@ def truncation_is_counted_and_named_rather_than_silent():
     return "2 of 3 over the limit, and the report says the bias direction"
 
 
+class FakeAzureClient:
+    """Stands in for the OpenAI client pointed at a Foundry deployment."""
+
+    def __init__(self, dim=DIMENSIONS, reverse=False):
+        self.embeddings = self
+        self.calls, self.dim, self.reverse = [], dim, reverse
+
+    def create(self, model=None, input=None, dimensions=None):
+        import types
+        texts = list(input)
+        self.calls.append({"model": model, "input": texts,
+                           "dimensions": dimensions})
+        rows = [types.SimpleNamespace(
+                    index=i,
+                    embedding=[float(len(t))] + [0.0] * (self.dim - 1))
+                for i, t in enumerate(texts)]
+        if self.reverse:
+            rows = rows[::-1]
+        return types.SimpleNamespace(
+            data=rows, usage=types.SimpleNamespace(prompt_tokens=7 * len(texts)))
+
+
+def make_azure(dim=DIMENSIONS, reverse=False):
+    from embedders import AzureEmbedder
+    e = AzureEmbedder.__new__(AzureEmbedder)
+    e.client = FakeAzureClient(dim=dim, reverse=reverse)
+    e.model, e.endpoint = "text-embedding-3-large", "https://x/openai/v1/"
+    e._encoder, e._tried = None, True
+    e.truncated_locally, e.real_tokens = False, 0
+    return e
+
+
+@case
+def the_request_pins_the_width():
+    """Every provider in the table is 1024 wide. If this one silently returned
+    3072 it would score better for a reason that is not the model."""
+    e = make_azure()
+    e.embed(["hello"])
+    assert e.client.calls[0]["dimensions"] == DIMENSIONS, e.client.calls[0]
+    return f"dimensions={DIMENSIONS} sent with the request"
+
+
+@case
+def order_follows_the_returned_index_not_the_arrival_order():
+    """The API documents input order, but the code sorts by the index it
+    returns, so a reordered response cannot misalign a vector with its chunk."""
+    e = make_azure(reverse=True)
+    texts = ["a", "bb", "ccc", "dddd"]
+    out = e.embed(texts)
+    assert [int(v[0]) for v in out] == [1, 2, 3, 4], [v[0] for v in out]
+    return "a reversed response still came back in input order"
+
+
+@case
+def a_native_width_response_is_truncated_and_renormalized():
+    """If the deployment ignores the dimensions parameter, a prefix of the
+    vector is still valid for this model family — but an unnormalized prefix
+    would make vector length count as similarity under a dot product."""
+    e = make_azure(dim=3072)
+    out = e.embed(["abcde"])          # first component is 5.0, rest zero
+    assert len(out[0]) == DIMENSIONS, len(out[0])
+    norm = sum(v * v for v in out[0]) ** 0.5
+    assert abs(norm - 1.0) < 1e-9, norm
+    assert e.truncated_locally is True
+    return f"3072 -> {DIMENSIONS}, norm {norm:.6f}"
+
+
+@case
+def a_narrower_response_stops_the_run():
+    """Truncating is possible; widening is not. A smaller model deployed by
+    mistake has to fail loudly, not produce a column that looks comparable."""
+    e = make_azure(dim=512)
+    try:
+        e.embed(["abc"])
+    except SystemExit as exc:
+        assert "512" in str(exc) and str(DIMENSIONS) in str(exc), str(exc)
+        return "exits naming both widths"
+    raise AssertionError("accepted a narrower vector")
+
+
+@case
+def the_endpoint_gets_the_api_path_exactly_once():
+    """The portal shows the bare resource endpoint, so the path is appended
+    here. Appending it to an endpoint that already carries it would 404."""
+    from embedders import azure_base_url
+    bare = "https://r-5669-resource.services.ai.azure.com"
+    assert azure_base_url(bare) == bare + "/openai/v1/"
+    assert azure_base_url(bare + "/") == bare + "/openai/v1/"
+    assert azure_base_url(bare + "/openai/v1") == bare + "/openai/v1/"
+    assert azure_base_url(bare + "/openai/v1/") == bare + "/openai/v1/"
+    return "bare, trailing slash, and already-pathed all normalize the same"
+
+
 def main():
     print(f"\n{'=' * 62}")
     print("  Embedding providers — offline checks")

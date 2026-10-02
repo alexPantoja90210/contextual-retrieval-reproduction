@@ -337,7 +337,149 @@ class LocalEmbedder(Embedder):
         return line
 
 
-PROVIDERS = {c.key: c for c in (VoyageEmbedder, BedrockEmbedder, LocalEmbedder)}
+# ----------------------------------------------------------------------- azure
+# OpenAI's text-embedding-3-large, served from an Azure AI Foundry deployment.
+#
+# The v1 endpoint speaks the plain OpenAI protocol, so this uses the ordinary
+# `OpenAI` client with a base_url rather than the older `AzureOpenAI` class and
+# its dated api-version strings. `model` is the DEPLOYMENT name chosen in the
+# portal, not the model's catalogue name; they match here by choice, and the
+# constructor says so because the next person will assume otherwise.
+AZURE_API_PATH = "/openai/v1/"
+# The deployment's own rate limit, read from the portal rather than guessed.
+AZURE_TPM = 120_000
+# text-embedding-3-large is 3072 natively. The comparison holds width fixed at
+# 1024 across every provider, so the width is requested from the API and then
+# verified on the first vector.
+NATIVE_DIMENSIONS = 3072
+
+
+def azure_base_url(endpoint):
+    """The v1 base URL for a Foundry resource endpoint.
+
+    The portal shows the resource endpoint without the API path, so the path is
+    appended here rather than asked of the user, who would paste what the portal
+    displays. Appending it twice would 404, so an endpoint that already carries
+    it is left alone.
+    """
+    endpoint = endpoint.strip().rstrip("/")
+    if endpoint.endswith(AZURE_API_PATH.rstrip("/")):
+        return endpoint + "/"
+    return endpoint + AZURE_API_PATH
+
+
+class AzureEmbedder(Embedder):
+    """text-embedding-3-large on Azure AI Foundry, truncated to 1024 dimensions.
+
+    Width is the one thing this class refuses to get wrong. A 3072-wide column
+    sitting beside three 1024-wide ones would score better for a reason that has
+    nothing to do with the model, and nothing downstream would notice.
+    """
+
+    key = "azure"
+    model = "text-embedding-3-large"      # deployment name in the portal
+    label = "text-embedding-3-large"
+    # The embeddings endpoint takes an array. The token cap does the real
+    # limiting; this just stops one request from carrying the whole corpus.
+    max_texts = 64
+    default_rpm, default_tpm = 600, AZURE_TPM
+    suffix = "_azure"
+
+    def __init__(self):
+        openai = require("openai")
+        endpoint = azure_base_url(need("AZURE_OPENAI_ENDPOINT",
+                                       "the Foundry project overview page"))
+        self.client = openai.OpenAI(
+            api_key=need("AZURE_OPENAI_API_KEY", "the Foundry project page"),
+            base_url=endpoint)
+        self.endpoint = endpoint
+        self._encoder, self._tried = None, False
+        self.truncated_locally = False
+        self.real_tokens = 0
+        print(f"  endpoint: {endpoint}")
+        print(f"  deployment: {self.model} at {AZURE_TPM:,} tokens/min")
+
+    # -- tokens --------------------------------------------------------------
+    def encoder(self):
+        """tiktoken when it is installed, a pessimistic estimate otherwise.
+
+        text-embedding-3-* uses cl100k_base. An exact count matters here because
+        the deployment enforces a real tokens-per-minute limit, unlike the
+        local provider where the number only paced a loop.
+        """
+        if not self._tried:
+            self._tried = True
+            try:
+                import tiktoken
+                self._encoder = tiktoken.get_encoding("cl100k_base")
+                print("  counting tokens with cl100k_base")
+            except Exception:
+                print("  tiktoken unavailable; estimating at 2.5 chars/token")
+        return self._encoder
+
+    def count(self, text):
+        enc = self.encoder()
+        if enc is not None:
+            try:
+                return max(1, len(enc.encode(text)))
+            except Exception:
+                pass
+        return max(1, int(len(text) / 2.5))
+
+    # -- embedding -----------------------------------------------------------
+    def _fit(self, vector):
+        """Return the vector at DIMENSIONS, normalized.
+
+        The API is asked for 1024 and normally returns it. When a deployment
+        ignores the parameter and returns the native width, truncating is still
+        correct for this model family — it is trained so a prefix of the vector
+        is itself a usable embedding — but the prefix has to be renormalized,
+        because the scoring is a dot product and an unnormalized vector would
+        make length count as similarity.
+        """
+        if len(vector) == DIMENSIONS:
+            return vector
+        if len(vector) < DIMENSIONS:
+            sys.exit(f"\n  The deployment returned {len(vector)} dimensions, "
+                     f"fewer than the {DIMENSIONS} this comparison holds fixed.\n"
+                     f"  A narrower vector cannot be widened. Deploy "
+                     f"text-embedding-3-large rather than a smaller model.")
+        if not self.truncated_locally:
+            self.truncated_locally = True
+            print(f"  the deployment returned {len(vector)} dimensions and "
+                  f"ignored the request for {DIMENSIONS};")
+            print(f"  truncating and renormalizing locally, which this model "
+                  f"family supports")
+        head = vector[:DIMENSIONS]
+        norm = sum(v * v for v in head) ** 0.5
+        return [v / norm for v in head] if norm else head
+
+    def embed(self, texts, kind="passage"):
+        # No query/passage distinction in this API, as with voyage and titan.
+        r = self.client.embeddings.create(
+            model=self.model, input=list(texts), dimensions=DIMENSIONS)
+        usage = getattr(r, "usage", None)
+        if usage is not None:
+            self.real_tokens += getattr(usage, "prompt_tokens", 0) or 0
+        # The API documents that data comes back in input order; sorting by the
+        # index it returns makes that a fact of this code rather than a trust.
+        rows = sorted(r.data, key=lambda d: d.index)
+        return [self._fit(d.embedding) for d in rows]
+
+    def report(self):
+        line = ""
+        if self.real_tokens:
+            line += f"  Azure billed {self.real_tokens:,} input tokens"
+        if self.truncated_locally:
+            line += ("\n  vectors were truncated to "
+                     f"{DIMENSIONS} dimensions locally and renormalized")
+        else:
+            line += f"\n  vectors arrived at {DIMENSIONS} dimensions as requested"
+        return line or None
+
+
+PROVIDERS = {c.key: c for c in (VoyageEmbedder, BedrockEmbedder,
+                                LocalEmbedder, AzureEmbedder)}
 
 
 def make_embedder(key):
