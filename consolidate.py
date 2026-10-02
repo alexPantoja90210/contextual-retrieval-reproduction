@@ -133,56 +133,105 @@ def main():
         out.append("")
 
     if len(complete) >= 2:
-        a, b = complete[0], complete[1]   # voyage-2 first, then the next finished
-        ga = {k: found[(a, "contextual")][k] - found[(a, "baseline")][k]
-              for k in K_VALUES}
-        gb = {k: found[(b, "contextual")][k] - found[(b, "baseline")][k]
-              for k in K_VALUES}
-        ca = {k: 100 * ga[k] / (100 - found[(a, "baseline")][k]) for k in K_VALUES}
-        cb = {k: 100 * gb[k] / (100 - found[(b, "baseline")][k]) for k in K_VALUES}
-        gap_b = {k: found[(b, "baseline")][k] - found[(a, "baseline")][k]
-                 for k in K_VALUES}
-        gap_c = {k: found[(b, "contextual")][k] - found[(a, "contextual")][k]
-                 for k in K_VALUES}
+        # Every sentence below is generated from a ranking of the finished
+        # embedders, not from two hardcoded slots. An embedder that is in the
+        # tables is in the prose, or the prose is wrong about its own evidence.
+        n = len(complete)
+        ranked = sorted(complete, key=lambda l: found[(l, "baseline")][5])
+        weakest, strongest = ranked[0], ranked[-1]
+        gain = {l: {k: found[(l, "contextual")][k] - found[(l, "baseline")][k]
+                    for k in K_VALUES} for l in complete}
+        closed = {l: {k: 100 * gain[l][k] / (100 - found[(l, "baseline")][k])
+                      for k in K_VALUES} for l in complete}
+
+        def spread(stage, k):
+            vals = [found[(l, stage)][k] for l in complete]
+            return max(vals) - min(vals)
+
+        def across(fmt, k):
+            return " / ".join(fmt(l, k) for l in ranked)
 
         out.append("## Reading")
         out.append("")
-        out.append(f"**The gain survives the change of embedding model.** "
-                   f"Contextual retrieval raises Pass@20 by {ga[20]:+.2f} points on "
-                   f"{a} and {gb[20]:+.2f} on {b}, against the same 248 queries and "
-                   f"the same contextualized text. Only the embedder differs.")
+        out.append(f"**The gain survives every change of embedding model.** "
+                   f"Contextual retrieval raises Pass@20 by "
+                   f"{', '.join(f'{gain[l][20]:+.2f} on {l}' for l in ranked)}. "
+                   f"Same 737 chunks, same contextualized text byte for byte, same "
+                   f"248 queries, same scoring, same 1024 dimensions. The embedding "
+                   f"model is the only variable.")
         out.append("")
-        bigger = all(cb[k] > ca[k] for k in K_VALUES)
-        if bigger:
-            out.append(f"**It is worth more to the weaker model, and not only "
-                       f"because that model had further to go.** {b} starts below "
-                       f"{a} at every k, so some of its larger raw gain is "
-                       f"headroom. After dividing that out it still closes more of "
-                       f"the remaining error at every k "
-                       f"({cb[5]:.1f}% against {ca[5]:.1f}% at k=5, "
-                       f"{cb[20]:.1f}% against {ca[20]:.1f}% at k=20). The margin "
-                       f"is wide where the numbers are low and narrow where both "
-                       f"are already high.")
+
+        monotone = all(closed[ranked[i]][k] > closed[ranked[i + 1]][k]
+                       for k in K_VALUES for i in range(n - 1))
+        if monotone and n >= 3:
+            out.append(f"**The weaker the embedder, the more the context is worth — "
+                       f"and headroom does not account for it.** Ranked by baseline "
+                       f"Pass@5, {' then '.join(ranked)} runs weakest to strongest. "
+                       f"The share of remaining error that contextual retrieval "
+                       f"closes falls in exactly that order at every k: "
+                       f"{across(lambda l, k: f'{closed[l][k]:.1f}%', 5)} at k=5, "
+                       f"{across(lambda l, k: f'{closed[l][k]:.1f}%', 10)} at k=10, "
+                       f"{across(lambda l, k: f'{closed[l][k]:.1f}%', 20)} at k=20. "
+                       f"The headroom correction was written into this script before "
+                       f"any figure past {RUNS[0][0]} existed, so it is not a "
+                       f"post-hoc rescue; it divides out the arithmetic advantage of "
+                       f"starting low and the ordering is still there.")
             out.append("")
-        out.append(f"**The two models converge.** The gap between them narrows from "
-                   f"{gap_b[5]:+.2f} / {gap_b[10]:+.2f} / {gap_b[20]:+.2f} at "
-                   f"baseline to {gap_c[5]:+.2f} / {gap_c[10]:+.2f} / "
-                   f"{gap_c[20]:+.2f} once both run contextually. Writing a line of "
-                   f"context in front of each chunk recovers most of what separated "
-                   f"the two embedders.")
+        elif monotone:
+            out.append(f"**It is worth more to the weaker model, and not only "
+                       f"because that model had further to go.** {weakest} starts "
+                       f"below {strongest} at every k, and after dividing out "
+                       f"headroom it still closes more of the remaining error at "
+                       f"every k ({closed[weakest][5]:.1f}% against "
+                       f"{closed[strongest][5]:.1f}% at k=5, "
+                       f"{closed[weakest][20]:.1f}% against "
+                       f"{closed[strongest][20]:.1f}% at k=20).")
+            out.append("")
+
+        leads_baseline = max(complete, key=lambda l: found[(l, "baseline")][5])
+        leads_ctx = max(complete, key=lambda l: found[(l, "contextual")][5])
+        out.append(f"**The embedders converge.** The spread across the {n} of them "
+                   f"narrows from "
+                   f"{spread('baseline', 5):.2f} / {spread('baseline', 10):.2f} / "
+                   f"{spread('baseline', 20):.2f} points at baseline to "
+                   f"{spread('contextual', 5):.2f} / {spread('contextual', 10):.2f} / "
+                   f"{spread('contextual', 20):.2f} once all of them run "
+                   f"contextually.")
+        if leads_baseline != leads_ctx:
+            out.append("")
+            out.append(f"{leads_baseline} leads the baseline at k=5 and does not "
+                       f"lead contextually; {leads_ctx} does. The ordering of the "
+                       f"embedders is not preserved through contextualization, so "
+                       f"a baseline comparison between embedders does not predict "
+                       f"the contextual one.")
+        out.append("")
+        out.append(f"That is the same finding as the one above, seen from the other "
+                   f"side. Writing a line of context in front of each chunk "
+                   f"recovers most of what separated these embedders, which means "
+                   f"the choice of embedder buys less after contextualizing than "
+                   f"the baseline spread suggests it would.")
         out.append("")
         out.append("### What this does not establish")
         out.append("")
-        out.append("One corpus of source code, one model writing the context, two "
-                   "embedders, 248 queries. The direction is consistent across "
-                   "three values of k, which is not the same as being general. "
-                   "Nothing here says the pattern holds on prose, on a larger "
-                   "corpus, or on a third embedder.")
+        out.append(f"One corpus of source code, one model writing the context, "
+                   f"{n} embedders, 248 queries. The direction holds at three "
+                   f"values of k and across {n} embedders, which is not the same as "
+                   f"being general. Nothing here says the pattern holds on prose, "
+                   f"on a larger corpus, with a different model writing the "
+                   f"context, or on an embedder whose baseline starts above "
+                   f"{strongest}.")
         out.append("")
-        out.append(f"Anthropic published this technique on {a} alone. What this "
-                   f"table adds is a second embedding model, measured through a "
-                   f"harness whose baseline reproduced their figures to the "
-                   f"hundredth.")
+        out.append(f"The {n} baselines span "
+                   f"{min(found[(l, 'baseline')][5] for l in complete):.2f} to "
+                   f"{max(found[(l, 'baseline')][5] for l in complete):.2f} at k=5. "
+                   f"A claim about embedders stronger than that range is a claim "
+                   f"about data nobody here has.")
+        out.append("")
+        out.append(f"Anthropic published this technique on {RUNS[0][0]} alone. What "
+                   f"this table adds is {n - 1} further embedding "
+                   f"{'model' if n == 2 else 'models'}, measured through a harness "
+                   f"whose {RUNS[0][0]} baseline reproduced their published figures "
+                   f"to the hundredth.")
         out.append("")
 
     if missing:

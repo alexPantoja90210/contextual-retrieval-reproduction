@@ -1,0 +1,21 @@
+{
+  "stage": "baseline",
+  "embedder": "azure",
+  "mine": {
+    "5": 83.88536866359448,
+    "10": 88.49366359447005,
+    "20": 91.85387864823349
+  },
+  "published": null,
+  "reference": {
+    "5": 80.91877880184332,
+    "10": 87.14957757296467,
+    "20": 90.06336405529954
+  },
+  "matched": true,
+  "chunks": 737,
+  "queries": 248,
+  "embed_model": "text-embedding-3-large",
+  "dimensions": 1024,
+  "model": null
+}
