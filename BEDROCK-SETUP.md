@@ -97,27 +97,75 @@ The reproduction itself — the voyage-2 baseline landing on Anthropic's
 published Pass@5/10/20 — is what makes that measurement worth reading. It is
 the evidence the harness reads true.
 
-## If you get Error 002
+## Error 002, and what was eliminated to call it account-level
 
-`ValidationException: Error 002: Access to Bedrock models is not allowed for
-this account` is not an IAM problem and no policy will fix it. It is an
-account-level restriction: the request was signed and authorized, and the
-service refused it afterwards. A missing permission produces
-`AccessDeniedException` instead, and the two strings are distinct for this
-reason.
+```
+ValidationException: Error 002: Access to Bedrock models is not allowed
+for this account
+```
 
-The check that separates them takes a minute. Open any model in the Bedrock
-console playground with an administrator identity. If listing and selecting
-models works but invoking fails with the same Error 002, the account is
-restricted and nothing configurable will change it.
+This is not an IAM problem and no policy will fix it. It is an account-level
+restriction: the request was signed and authorized, and the service refused it
+afterwards. A missing permission produces `AccessDeniedException` instead, and
+the two strings are distinct for that reason.
 
-The error is not in Bedrock's published list of API error codes. Reported
-causes include accounts without payment history and organization-level Service
-Control Policies. The route is a support case under **Account and billing**,
-which needs no paid support plan.
+### What was tried here
 
-Meanwhile `--embedder=arctic` runs the same benchmark locally with no account
-at all.
+This section is written from a real account that hit it, rather than from the
+documentation, because the documentation does not cover this code. Everything
+below was eliminated before concluding anything.
+
+| Checked | Result |
+| --- | --- |
+| Scoped IAM user with `bedrock:InvokeModel` on the Titan embedding model | Error 002 |
+| The same call from an identity with AdministratorAccess | Error 002 |
+| `us-east-1` | Error 002 |
+| `us-west-2` | Error 002 |
+| From the Bedrock console playground, not the SDK | Error 002 |
+| Models other than Titan — Nova Lite, Nova 2 Lite | Error 002 |
+| The **Model access** page, to request or enable a model | Retired; there is no longer anything to enable |
+
+So it is not the policy, not the key, not the region, not the SDK, not the
+model, and not an unrequested model grant. Listing and selecting models works.
+Only invocation is refused, identically, everywhere.
+
+That combination leaves the account itself, which is what the message says and
+what nothing configurable can change.
+
+### What the error is not
+
+It is **not in Bedrock's published list of API error codes**. Searching for it
+returns forum posts rather than documentation, and the causes reported there —
+accounts with no payment history, organization-level Service Control Policies —
+are plausible explanations that this account could neither confirm nor rule out
+from the outside. They are listed as leads, not as the answer.
+
+### The route, and its honest odds
+
+A support case under **Account and billing**, which needs no paid support plan.
+Case `179074483400988` was opened for this account and was still unassigned and
+unanswered when this file was written (2026-10-02). That is the whole route;
+there is no API call, console toggle or policy that routes around it.
+
+### It does not block the benchmark
+
+`--embedder=arctic` runs every stage locally with no account anywhere, and
+`--embedder=azure` runs on an Azure AI Foundry deployment. The Titan path in
+`embedders.py` is written and covered by `test_embedders.py`, so if the account
+is ever unblocked the column is four commands away and nothing needs changing:
+
+```powershell
+python reproduce.py baseline   --embedder=titan
+python reproduce.py contextual --embedder=titan
+python reproduce.py hybrid     --embedder=titan
+python reproduce.py rerank     --embedder=titan
+```
+
+Worth knowing before spending effort on that: the three embedders already
+measured land on the same Pass@k to every decimal once reranking is applied
+(see RESULTS.md). A fourth is unlikely to change the conclusion. It would
+confirm it on one more model, which is worth something and is not worth
+waiting for.
 
 ## Teardown
 
